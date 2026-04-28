@@ -67,6 +67,16 @@ export default function App() {
   const [masterData, setMasterData] = useState<MasterRow[]>([]);
   const [modelUsed, setModelUsed] = useState<string>("");
   const [errorMessage, setErrorMessage] = useState<string>("");
+  const [isApiKeyMissing, setIsApiKeyMissing] = useState<boolean>(false);
+  
+  useEffect(() => {
+    // Check for API key on mount
+    const key = import.meta.env.VITE_GEMINI_API_KEY;
+    if (!key) {
+      setIsApiKeyMissing(true);
+      setErrorMessage("ADVERTENCIA: Falta la variable de entorno VITE_GEMINI_API_KEY. Configúrala en Vercel para que la extracción funcione.");
+    }
+  }, []);
   
   const [showSearch, setShowSearch] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -330,7 +340,13 @@ export default function App() {
           </div>
         </div>
         <div className="p-6 border-t border-slate-200 bg-white">
-          <button disabled={files.length === 0 || status === "processing"} onClick={executeExtraction} className="w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-200 disabled:text-slate-400 text-white shadow-sm font-semibold rounded-xl py-3.5 transition-all text-sm">
+          {isApiKeyMissing && (
+            <div className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-2 text-amber-700">
+              <AlertCircle size={16} className="flex-shrink-0 mt-0.5" />
+              <p className="text-[10px] font-medium leading-tight">Configura VITE_GEMINI_API_KEY en Vercel</p>
+            </div>
+          )}
+          <button disabled={files.length === 0 || status === "processing" || isApiKeyMissing} onClick={executeExtraction} className="w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-200 disabled:text-slate-400 text-white shadow-sm font-semibold rounded-xl py-3.5 transition-all text-sm">
             {status === "processing" ? <Loader2 size={18} className="animate-spin" /> : <Play size={18} fill="currentColor" />} Iniciar Extracción
           </button>
         </div>
@@ -435,6 +451,31 @@ export default function App() {
                     })}
                   </tbody>
                 </table>
+              </div>
+            </div>
+          )}
+
+          {status === "processing" && (
+            <div className="absolute inset-0 z-50 bg-white/60 backdrop-blur-sm flex flex-col items-center justify-center">
+              <div className="bg-white p-8 rounded-3xl shadow-2xl border border-slate-100 flex flex-col items-center gap-6 max-w-sm text-center">
+                <div className="relative">
+                  <div className="absolute inset-0 bg-blue-100 rounded-full animate-ping opacity-20" />
+                  <div className="relative p-5 bg-blue-50 text-blue-600 rounded-full">
+                    <Sparkles size={32} className="animate-pulse" />
+                  </div>
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-slate-800 mb-2">Extrayendo Datos con IA</h3>
+                  <p className="text-sm text-slate-500 leading-relaxed">Estamos analizando tus documentos. Esto puede tomar unos segundos dependiendo de la complejidad...</p>
+                </div>
+                <div className="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden">
+                  <motion.div 
+                    initial={{ x: "-100%" }}
+                    animate={{ x: "100%" }}
+                    transition={{ repeat: Infinity, duration: 1.5, ease: "linear" }}
+                    className="w-1/2 h-full bg-blue-600 rounded-full"
+                  />
+                </div>
               </div>
             </div>
           )}
