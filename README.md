@@ -1,35 +1,45 @@
-# Configuración para Gemini API (obligatorio)
+# IntelliExtract - Asistencia OCR
 
-Para que la app funcione en local y en Vercel necesitas una API Key de Gemini:
+Aplicación de Visión Computacional y OCR especializada en la extracción de datos de documentos corporativos y registros de asistencia mediante modelos avanzados de Google Gemini.
 
-1. Crea un archivo `.env` en la raíz del proyecto (puedes copiar el ejemplo `.env.example`).
-2. Añade tu API Key:
-   ```env
-   VITE_GEMINI_API_KEY=tu_api_key_de_gemini_aqui
-   ```
-3. En Vercel, ve a Settings > Environment Variables y agrega:
-   - **Name:** `VITE_GEMINI_API_KEY`
-   - **Value:** tu API Key
-   - **Environment:** Production y Preview
+🌐 **Despliegue en Producción:** [https://extractor-list.vercel.app/](https://extractor-list.vercel.app/)
 
-Si no configuras esta variable, la app no funcionará ni en local ni en producción.
 <div align="center">
 <img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
 </div>
 
-# Run and deploy your AI Studio app
+## ⚙️ Configuración de Variables de Entorno (Obligatorio)
 
-This contains everything you need to run your app locally.
+Esta aplicación requiere una API Key de Google Gemini para funcionar (tanto en local como en Vercel). El proyecto utiliza Vite, por lo que la variable debe usar el prefijo `VITE_`.
 
-View your app in AI Studio: https://ai.studio/apps/21b31829-b6ad-4818-af13-3387b3c0ae97
+### En Desarrollo Local
+1. Crea un archivo `.env` en la raíz del proyecto (puedes copiar el contenido de `.env.example`).
+2. Añade tu API Key:
+   ```env
+   VITE_GEMINI_API_KEY="tu_api_key_de_gemini_aqui"
+   ```
 
-## Run Locally
+### En Producción (Vercel)
+Para que el despliegue funcione correctamente, debes configurar la variable en el panel de Vercel:
+1. Ve a tu proyecto en Vercel > **Settings** > **Environment Variables**.
+2. Agrega una nueva variable:
+   - **Key:** `VITE_GEMINI_API_KEY`
+   - **Value:** `tu_api_key_de_gemini_aqui`
+3. Guarda la configuración.
+4. **Importante:** Ve a la pestaña **Deployments** y realiza un **Redeploy** para que la variable se inyecte en el nuevo *build*.
 
-**Prerequisites:**  Node.js
+> ⚠️ Si no configuras esta variable en Vercel, el botón de extracción se deshabilitará por seguridad y mostrará una alerta naranja en la interfaz.
 
+## 🚀 Instalación y Ejecución Local
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+**Requisitos:** Node.js
+
+1. Instala las dependencias:
+   ```bash
+   npm install
+   ```
+2. Asegúrate de tener configurado tu archivo `.env` con la variable `VITE_GEMINI_API_KEY`.
+3. Inicia el servidor de desarrollo:
+   ```bash
+   npm run dev
+   ```
