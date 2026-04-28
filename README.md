@@ -1,3 +1,18 @@
+# Configuración para Gemini API (obligatorio)
+
+Para que la app funcione en local y en Vercel necesitas una API Key de Gemini:
+
+1. Crea un archivo `.env` en la raíz del proyecto (puedes copiar el ejemplo `.env.example`).
+2. Añade tu API Key:
+   ```env
+   VITE_GEMINI_API_KEY=tu_api_key_de_gemini_aqui
+   ```
+3. En Vercel, ve a Settings > Environment Variables y agrega:
+   - **Name:** `VITE_GEMINI_API_KEY`
+   - **Value:** tu API Key
+   - **Environment:** Production y Preview
+
+Si no configuras esta variable, la app no funcionará ni en local ni en producción.
 <div align="center">
 <img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
 </div>

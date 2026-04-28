@@ -1,5 +1,5 @@
 import { GoogleGenAI } from "@google/genai";
-import { EXTRACTION_PROMPT as PROMPT, GEMINI_MODELS as MODELS } from "@/src/config";
+import { EXTRACTION_PROMPT as PROMPT, GEMINI_MODELS as MODELS } from "@/config";
 
 export interface ProcessedResult {
   csv: string;
@@ -7,9 +7,10 @@ export interface ProcessedResult {
 }
 
 export async function processDocuments(files: { data: string; mimeType: string; name: string }[]): Promise<ProcessedResult> {
-  const apiKey = process.env.GEMINI_API_KEY;
+  // Usar el estándar de Vite para variables de entorno
+  const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
   if (!apiKey) {
-    throw new Error("Missing GEMINI_API_KEY");
+    throw new Error("Falta la variable de entorno VITE_GEMINI_API_KEY. Configúrala en tu archivo .env o en Vercel.");
   }
 
   const ai = new GoogleGenAI({ apiKey });
@@ -43,7 +44,16 @@ export async function processDocuments(files: { data: string; mimeType: string; 
         },
       });
 
-      let text = response.text || "";
+      // Compatibilidad con diferentes estructuras de respuesta
+      let text = "";
+      if (response.text) {
+        text = response.text;
+      } else if (response.candidates && response.candidates[0]?.content?.parts?.[0]?.text) {
+        text = response.candidates[0].content.parts[0].text;
+      } else {
+        throw new Error("No se pudo obtener el texto de la respuesta de Gemini");
+      }
+
       text = text.replace(/^```(csv|txt)?\n/i, "");
       text = text.replace(/\n```$/i, "");
       text = text.trim();

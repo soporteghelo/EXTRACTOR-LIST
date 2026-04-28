@@ -166,6 +166,7 @@ export default function App() {
       setModelUsed(result.modelUsed);
       setStatus("success");
     } catch (err: any) {
+      console.error("Extraction failed:", err);
       setStatus("error");
       setErrorMessage(err.message || "Error en el procesamiento.");
     }
@@ -363,6 +364,26 @@ export default function App() {
         </header>
 
         <div className="flex-1 overflow-y-auto p-8 relative scrollbar-hide">
+          {status === "error" && errorMessage && (
+            <motion.div 
+              initial={{ opacity: 0, y: -20 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="mb-6 p-4 bg-red-50 border border-red-200 rounded-2xl flex items-start gap-3 text-red-700 shadow-sm"
+            >
+              <AlertCircle className="flex-shrink-0 mt-0.5" size={20} />
+              <div>
+                <p className="text-sm font-bold">Error de Extracción</p>
+                <p className="text-xs mt-1 leading-relaxed opacity-90 font-mono bg-white/50 p-2 rounded-lg border border-red-100 mt-2">{errorMessage}</p>
+                <button 
+                  onClick={() => setStatus("idle")}
+                  className="mt-3 text-[10px] font-bold uppercase tracking-wider bg-red-700 text-white px-3 py-1.5 rounded-lg hover:bg-red-800 transition-colors"
+                >
+                  Entendido
+                </button>
+              </div>
+            </motion.div>
+          )}
+
           {extractedData.length > 0 && (
             <div className="w-full bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden flex flex-col mb-20">
               <div className="overflow-x-auto">
