@@ -10,10 +10,9 @@ export const MASTER_DATA_URL = "https://docs.google.com/spreadsheets/d/1OqjJIobn
  * Gemini AI Configuration
  */
 export const GEMINI_MODELS = [
-  "gemini-3-flash-preview", 
-  "gemini-3.1-pro-preview",
-  "gemini-2.0-flash-exp",
+  "gemini-2.0-flash",
   "gemini-1.5-flash",
+  "gemini-1.5-pro",
 ];
 
 export const EXTRACTION_PROMPT = `Rol: Eres un sistema avanzado de Visión Computacional, OCR (Reconocimiento Óptico de Caracteres) y Extracción de Datos especializado en documentos corporativos y registros de asistencia con escritura a mano alzada.
