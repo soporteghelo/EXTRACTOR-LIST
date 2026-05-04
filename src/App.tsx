@@ -89,7 +89,7 @@ export default function App() {
   const panStartRef = useRef({ x: 0, y: 0 });
 
   const [tableFilter, setTableFilter] = useState("");
-  const [sortConfig, setSortConfig] = useState<{ key: keyof ExtractedRow, direction: 'asc' | 'desc' } | null>(null);
+  const [sortConfig, setSortConfig] = useState<{ key: string, direction: 'asc' | 'desc' } | null>(null);
   const [activeFilters, setActiveFilters] = useState<{ [key: string]: string[] }>({});
   const [openFilterMenu, setOpenFilterMenu] = useState<string | null>(null);
   
@@ -275,8 +275,17 @@ export default function App() {
     });
     if (sortConfig) {
       result.sort((a, b) => {
-        const valA = a[sortConfig.key].toString().toLowerCase();
-        const valB = b[sortConfig.key].toString().toLowerCase();
+        let valA: string;
+        let valB: string;
+
+        if (sortConfig.key === "estado") {
+          valA = !!getMasterInfo(a.dni) ? "OK" : "FUERA";
+          valB = !!getMasterInfo(b.dni) ? "OK" : "FUERA";
+        } else {
+          valA = (a[sortConfig.key as keyof ExtractedRow] ?? "").toString().toLowerCase();
+          valB = (b[sortConfig.key as keyof ExtractedRow] ?? "").toString().toLowerCase();
+        }
+
         if (valA < valB) return sortConfig.direction === 'asc' ? -1 : 1;
         if (valA > valB) return sortConfig.direction === 'asc' ? 1 : -1;
         return 0;
@@ -285,7 +294,7 @@ export default function App() {
     return result;
   }, [extractedData, tableFilter, sortConfig, activeFilters]);
 
-  const toggleSort = (key: keyof ExtractedRow) => setSortConfig(prev => (prev?.key === key && prev.direction === 'asc') ? { key, direction: 'desc' } : { key, direction: 'asc' });
+  const toggleSort = (key: string) => setSortConfig(prev => (prev?.key === key && prev.direction === 'asc') ? { key, direction: 'desc' } : { key, direction: 'asc' });
   const toggleFilterValue = (column: string, value: string) => setActiveFilters(prev => {
     const current = prev[column] || [];
     const updated = current.includes(value) ? current.filter(v => v !== value) : [...current, value];
