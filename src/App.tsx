@@ -1,3 +1,13 @@
+// Función para resaltar coincidencias en texto
+function highlightMatch(text: string, query: string) {
+  if (!query) return text;
+  const regex = new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "gi");
+  return text.split(regex).map((part, i) =>
+    part.toLowerCase() === query.toLowerCase() ? (
+      <mark key={i} style={{ background: "#ffe066", padding: 0 }}>{part}</mark>
+    ) : part
+  );
+}
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -182,6 +192,29 @@ export default function App() {
     }
   };
 
+  // Levenshtein distance para similitud de cadenas
+  function levenshtein(a: string, b: string) {
+    const an = a ? a.length : 0;
+    const bn = b ? b.length : 0;
+    if (an === 0) return bn;
+    if (bn === 0) return an;
+    const matrix = Array.from({ length: an + 1 }, () => Array(bn + 1).fill(0));
+    for (let i = 0; i <= an; i++) matrix[i][0] = i;
+    for (let j = 0; j <= bn; j++) matrix[0][j] = j;
+    for (let i = 1; i <= an; i++) {
+      for (let j = 1; j <= bn; j++) {
+        const cost = a[i - 1].toLowerCase() === b[j - 1].toLowerCase() ? 0 : 1;
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j] + 1,
+          matrix[i][j - 1] + 1,
+          matrix[i - 1][j - 1] + cost
+        );
+      }
+    }
+    return matrix[an][bn];
+  }
+
+  // Mejor reconocimiento de coincidencias por IA
   const tryFuzzyMatch = () => {
     const updated = [...extractedData];
     let matchesFound = 0;
@@ -189,14 +222,19 @@ export default function App() {
       if (!getMasterInfo(row.dni)) {
         const query = row.nombre.toLowerCase().trim();
         if (query.length < 4) return;
-        const tokens = query.split(/\s+/).filter(t => t.length > 2);
-        const match = masterData.find(m => {
-          const mName = m.nombre.toLowerCase();
-          const matchingTokens = tokens.filter(t => mName.includes(t));
-          return matchingTokens.length >= Math.min(tokens.length, 2);
+        // Buscar mejor coincidencia por similitud de Levenshtein
+        let bestMatch: MasterRow | null = null;
+        let bestScore = Infinity;
+        masterData.forEach(m => {
+          const score = levenshtein(query, m.nombre.toLowerCase());
+          if (score < bestScore) {
+            bestScore = score;
+            bestMatch = m;
+          }
         });
-        if (match) {
-          updated[idx].dni = match.dni;
+        // Si la similitud es suficientemente alta (ajustar umbral según necesidad)
+        if (bestMatch && bestScore <= Math.max(3, Math.floor(query.length * 0.25))) {
+          updated[idx].dni = bestMatch.dni;
           updated[idx].method = "IA";
           matchesFound++;
         }
@@ -204,7 +242,7 @@ export default function App() {
     });
     if (matchesFound > 0) {
       setExtractedData(updated);
-      alert(`Se encontraron ${matchesFound} coincidencias por nombre.`);
+      alert(`Se encontraron ${matchesFound} coincidencias por nombre (IA mejorada).`);
     } else alert("No se encontraron nuevas coincidencias.");
   };
 
@@ -436,7 +474,7 @@ export default function App() {
                           <td className="px-4 py-3 text-center">
                             <button onClick={() => handleViewSource(row.sourceFile)} className="p-1.5 text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"><Eye size={16} /></button>
                           </td>
-                          <td className="px-6 py-3 truncate max-w-[180px] text-slate-800">{row.nombre}</td>
+                          <td className="px-6 py-3 truncate max-w-[180px] text-slate-800">{highlightMatch(row.nombre, tableFilter)}</td>
                           <td className="px-6 py-3">
                             <input type="text" value={row.dni} onChange={(e) => {
                               const originalIdx = extractedData.findIndex(r => r === row);
@@ -445,6 +483,12 @@ export default function App() {
                               updated[originalIdx].method = "MANUAL";
                               setExtractedData(updated);
                             }} className={`w-full px-2 py-1 rounded border outline-none transition-all font-mono text-sm ${isValid ? "bg-emerald-50 border-emerald-200 text-emerald-800" : "bg-red-50 border-red-200 text-red-800"}`} />
+                            {/* Resaltado visual en el input del DNI */}
+                            {tableFilter && row.dni.toLowerCase().includes(tableFilter.toLowerCase()) && (
+                              <div style={{ position: 'absolute', right: 8, top: 8, pointerEvents: 'none' }}>
+                                <mark style={{ background: '#ffe066', padding: 0 }}>{tableFilter}</mark>
+                              </div>
+                            )}
                           </td>
                           <td className="px-4 py-3 text-center">
                             <span className={`inline-flex items-center px-2 py-1 rounded-full text-[10px] font-bold ${isValid ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"}`}>{isValid ? "OK" : "FUERA"}</span>
