@@ -1,3 +1,5 @@
+// URL del Apps Script Web App (reemplaza por tu URL real)
+const GOOGLE_SHEETS_WEBAPP_URL = "URL_DE_TU_WEBAPP";
 // Función para resaltar coincidencias en texto
 function highlightMatch(text: string, query: string) {
   if (!query) return text;
@@ -71,6 +73,42 @@ function parseCSVRow(row: string) {
 }
 
 export default function App() {
+  const [sending, setSending] = useState(false);
+    // Enviar datos a Google Sheets
+    const handleSendToSheets = async () => {
+      const IdRef = prompt("Ingrese el IdRef para enviar los datos:");
+      if (!IdRef) {
+        alert("Debe ingresar un IdRef para continuar.");
+        return;
+      }
+      setSending(true);
+      try {
+        const participantes = displayedData.map((row: ExtractedRow) => ({
+          ParticipanteDNI: row.dni,
+          Participante: row.nombre,
+          Cargo: row.ocupacion,
+          Area: row.area
+        }));
+        const response = await fetch(GOOGLE_SHEETS_WEBAPP_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ IdRef, participantes })
+        });
+        const result = await response.json();
+        if (result.success) {
+          alert("¡Datos enviados correctamente a Google Sheets!");
+        } else {
+          alert("Error al enviar: " + result.message);
+        }
+      } catch (err: unknown) {
+        if (err instanceof Error) {
+          alert("Error de red o servidor: " + err.message);
+        } else {
+          alert("Error de red o servidor desconocido");
+        }
+      }
+      setSending(false);
+    };
   const [files, setFiles] = useState<DocumentFile[]>([]);
   const [status, setStatus] = useState<"idle" | "processing" | "success" | "error">("idle");
   const [extractedData, setExtractedData] = useState<ExtractedRow[]>([]);
@@ -81,7 +119,7 @@ export default function App() {
   
   useEffect(() => {
     // Check for API key on mount
-    const key = import.meta.env.VITE_GEMINI_API_KEY;
+    const key = (import.meta as any).env?.VITE_GEMINI_API_KEY;
     if (!key) {
       setIsApiKeyMissing(true);
       setErrorMessage("ADVERTENCIA: Falta la variable de entorno VITE_GEMINI_API_KEY. Configúrala en Vercel para que la extracción funcione.");
@@ -131,12 +169,12 @@ export default function App() {
   const normalizeDni = (dni: string) => dni.toString().replace(/^0+/, "").trim();
   const getMasterInfo = (dni: string) => {
     const normalized = normalizeDni(dni);
-    return masterData.find(m => normalizeDni(m.dni) === normalized);
+    return masterData.find((m: MasterRow) => normalizeDni(m.dni) === normalized);
   };
 
   const handleFilesAdded = async (newFiles: FileList | null) => {
     if (!newFiles || newFiles.length === 0) return;
-    const validFiles = Array.from(newFiles).filter(f => f.type.startsWith("image/") || f.type === "application/pdf");
+    const validFiles = Array.from(newFiles).filter((f: File) => f.type.startsWith("image/") || f.type === "application/pdf");
     const newProcessedFiles: DocumentFile[] = [];
     for (const f of validFiles) {
       try {
@@ -159,7 +197,7 @@ export default function App() {
       } catch (err) { console.error("Error processing file:", f.name, err); }
     }
     if (newProcessedFiles.length > 0) {
-      setFiles(prev => [...prev, ...newProcessedFiles]);
+      setFiles((prev: DocumentFile[]) => [...prev, ...newProcessedFiles]);
       setStatus("idle");
     }
     if (fileInputRef.current) fileInputRef.current.value = "";
@@ -174,14 +212,14 @@ export default function App() {
       const inputFormats = files.map((f) => ({ data: f.base64, mimeType: f.mimeType, name: f.name }));
       const result = await processDocuments(inputFormats);
       const rows = result.csv.split('\n').slice(1);
-      const parsed: ExtractedRow[] = rows.map(row => {
+      const parsed: ExtractedRow[] = rows.map((row: string) => {
         const cols = row.split(';');
         return {
           nro: cols[0] || "", nombre: cols[1] || "", dni: cols[2] || "",
           ocupacion: cols[3] || "", area: cols[4] || "", sourceFile: cols[5]?.trim() || "",
-          method: "DEFAULT"
+          method: "DEFAULT" as MatchMethod
         };
-      }).filter(r => r.nombre || r.dni);
+      }).filter((r: ExtractedRow) => r.nombre || r.dni);
       setExtractedData(parsed);
       setModelUsed(result.modelUsed);
       setStatus("success");
@@ -218,14 +256,14 @@ export default function App() {
   const tryFuzzyMatch = () => {
     const updated = [...extractedData];
     let matchesFound = 0;
-    updated.forEach((row, idx) => {
+    updated.forEach((row: ExtractedRow, idx: number) => {
       if (!getMasterInfo(row.dni)) {
         const query = row.nombre.toLowerCase().trim();
         if (query.length < 4) return;
         // Buscar mejor coincidencia por similitud de Levenshtein
         let bestMatch: MasterRow | null = null;
         let bestScore = Infinity;
-        masterData.forEach(m => {
+        masterData.forEach((m: MasterRow) => {
           const score = levenshtein(query, m.nombre.toLowerCase());
           if (score < bestScore) {
             bestScore = score;
@@ -235,7 +273,7 @@ export default function App() {
         // Si la similitud es suficientemente alta (ajustar umbral según necesidad)
         if (bestMatch && bestScore <= Math.max(3, Math.floor(query.length * 0.25))) {
           updated[idx].dni = bestMatch.dni;
-          updated[idx].method = "IA";
+          updated[idx].method = "IA" as MatchMethod;
           matchesFound++;
         }
       }
@@ -248,17 +286,17 @@ export default function App() {
 
   const getCsvString = () => {
     const header = "DNI;NOMBRE OFICIAL;OCUPACION;AREA;METODO;ORIGEN";
-    const bodyRows = displayedData.map(row => {
+    const bodyRows = displayedData.map((row: ExtractedRow) => {
       const master = getMasterInfo(row.dni);
       if (!master) return null;
       return `${row.dni.toUpperCase()};${master.nombre.toUpperCase()};${master.cargo.toUpperCase()};${master.area.toUpperCase()};${row.method};${row.sourceFile}`;
-    }).filter(r => r !== null);
+    }).filter((r: string | null) => r !== null);
     return [header, ...bodyRows].join('\n');
   };
 
   const handleViewSource = (filename: string) => {
     if (!filename) return;
-    const file = files.find(f => f.name.toLowerCase().includes(filename.toLowerCase().split('.')[0]));
+    const file = files.find((f: DocumentFile) => f.name.toLowerCase().includes(filename.toLowerCase().split('.')[0]));
     if (file?.previewUrl) {
       setViewingImage({ url: file.previewUrl, name: file.name });
       setZoomLevel(1); setPanOffset({ x: 0, y: 0 });
@@ -297,12 +335,12 @@ export default function App() {
     let result = [...extractedData];
     if (tableFilter) {
       const q = tableFilter.toLowerCase();
-      result = result.filter(r => r.nombre.toLowerCase().includes(q) || r.dni.toLowerCase().includes(q) || r.sourceFile.toLowerCase().includes(q));
+      result = result.filter((r: ExtractedRow) => r.nombre.toLowerCase().includes(q) || r.dni.toLowerCase().includes(q) || r.sourceFile.toLowerCase().includes(q));
     }
-    Object.keys(activeFilters).forEach(key => {
+    Object.keys(activeFilters).forEach((key: string) => {
       const selectedValues = activeFilters[key];
       if (selectedValues.length > 0) {
-        result = result.filter(r => {
+        result = result.filter((r: ExtractedRow) => {
           if (key === "estado") {
             const master = getMasterInfo(r.dni);
             return selectedValues.includes(!!master ? "OK" : "FUERA");
@@ -312,7 +350,7 @@ export default function App() {
       }
     });
     if (sortConfig) {
-      result.sort((a, b) => {
+      result.sort((a: ExtractedRow, b: ExtractedRow) => {
         let valA: string;
         let valB: string;
 
@@ -332,16 +370,16 @@ export default function App() {
     return result;
   }, [extractedData, tableFilter, sortConfig, activeFilters]);
 
-  const toggleSort = (key: string) => setSortConfig(prev => (prev?.key === key && prev.direction === 'asc') ? { key, direction: 'desc' } : { key, direction: 'asc' });
-  const toggleFilterValue = (column: string, value: string) => setActiveFilters(prev => {
+  const toggleSort = (key: string) => setSortConfig((prev: { key: string, direction: 'asc' | 'desc' } | null) => (prev?.key === key && prev.direction === 'asc') ? { key, direction: 'desc' } : { key, direction: 'asc' });
+  const toggleFilterValue = (column: string, value: string) => setActiveFilters((prev: { [key: string]: string[] }) => {
     const current = prev[column] || [];
-    const updated = current.includes(value) ? current.filter(v => v !== value) : [...current, value];
+    const updated = current.includes(value) ? current.filter((v: string) => v !== value) : [...current, value];
     return { ...prev, [column]: updated };
   });
 
   const getUniqueValues = (column: string) => {
     if (column === "estado") return ["OK", "FUERA"];
-    const values = extractedData.map(r => r[column as keyof ExtractedRow] as string);
+    const values = extractedData.map((r: ExtractedRow) => r[column as keyof ExtractedRow] as string);
     return Array.from(new Set(values)).filter(Boolean).sort();
   };
 
@@ -349,7 +387,7 @@ export default function App() {
     if (!searchQuery.trim()) return [];
     const query = searchQuery.toLowerCase().trim();
     const normalizedQuery = normalizeDni(query);
-    return masterData.filter(m => {
+    return masterData.filter((m: MasterRow) => {
       const nameMatch = m.nombre.toLowerCase().includes(query);
       const dniMatch = normalizeDni(m.dni).includes(normalizedQuery);
       return nameMatch || dniMatch;
@@ -422,6 +460,14 @@ export default function App() {
                 const link = document.createElement("a");
                 link.href = url; link.setAttribute("download", "participantes.csv"); link.click();
               }} className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-white bg-slate-800 rounded-lg hover:bg-slate-900 transition-colors"><Download size={16} /> Descargar</button>
+              <button
+                disabled={sending || displayedData.length === 0}
+                onClick={handleSendToSheets}
+                className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-white bg-green-600 rounded-lg hover:bg-green-700 transition-colors"
+              >
+                {sending ? <Loader2 size={16} className="animate-spin" /> : <Database size={16} />}
+                Enviar a Sheets
+              </button>
             </div>
           )}
         </header>
