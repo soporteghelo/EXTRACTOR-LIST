@@ -11,8 +11,9 @@ export const MASTER_DATA_URL = "https://docs.google.com/spreadsheets/d/1OqjJIobn
  */
 export const GEMINI_MODELS = [
   "gemini-2.0-flash",
-  "gemini-1.5-flash",
-  "gemini-1.5-pro",
+  "gemini-2.5-flash",
+  "gemini-flash-latest",
+  "gemini-3-flash-preview",
 ];
 
 export const EXTRACTION_PROMPT = `Rol: Eres un sistema avanzado de Visión Computacional, OCR (Reconocimiento Óptico de Caracteres) y Extracción de Datos especializado en documentos corporativos y registros de asistencia con escritura a mano alzada.
