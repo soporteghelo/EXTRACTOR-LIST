@@ -1,4 +1,4 @@
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import { EXTRACTION_PROMPT as PROMPT, GEMINI_MODELS as MODELS } from "@/config";
 
 export interface ProcessedResult {
@@ -7,13 +7,12 @@ export interface ProcessedResult {
 }
 
 export async function processDocuments(files: { data: string; mimeType: string; name: string }[]): Promise<ProcessedResult> {
-  // Usar el estándar de Vite para variables de entorno
   const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
   if (!apiKey) {
-    throw new Error("Falta la variable de entorno VITE_GEMINI_API_KEY. Configúrala en tu archivo .env o en Vercel.");
+    throw new Error("Falta la variable de entorno VITE_GEMINI_API_KEY.");
   }
 
-  const ai = new GoogleGenAI({ apiKey });
+  const genAI = new GoogleGenerativeAI(apiKey);
 
   const parts: any[] = [];
   files.forEach((file, index) => {
@@ -31,47 +30,42 @@ export async function processDocuments(files: { data: string; mimeType: string; 
   });
 
   let lastError: any;
+  const triedModels: string[] = [];
 
-  for (const model of MODELS) {
+  for (const modelName of MODELS) {
     try {
-      console.log(`Intentando con el modelo: ${model}`);
-      const response = await ai.models.generateContent({
-        model,
-        contents: { parts },
-        config: {
-          systemInstruction: PROMPT,
-          temperature: 0.1, 
-        },
+      console.log(`Intentando extracción con el modelo: ${modelName}`);
+      triedModels.push(modelName);
+      
+      const model = genAI.getGenerativeModel({ 
+        model: modelName,
+        systemInstruction: PROMPT 
       });
 
-      // Compatibilidad con diferentes estructuras de respuesta
-      let text = "";
-      if (response.text) {
-        text = response.text;
-      } else if (response.candidates && response.candidates[0]?.content?.parts?.[0]?.text) {
-        text = response.candidates[0].content.parts[0].text;
-      } else {
-        throw new Error("No se pudo obtener el texto de la respuesta de Gemini");
-      }
+      const result = await model.generateContent(parts);
+      const response = await result.response;
+      let text = response.text();
+
+      if (!text) throw new Error("Respuesta vacía del modelo.");
 
       text = text.replace(/^```(csv|txt)?\n/i, "");
       text = text.replace(/\n```$/i, "");
       text = text.trim();
 
-      // Ensure headers are present with the SourceFile column
       if (!text.toLowerCase().includes("sourcefile")) {
          text = "Nro;Apellidos y Nombres;DNI;Ocupacion;Area;SourceFile\n" + text;
       }
 
+      console.log(`¡Éxito con el modelo ${modelName}!`);
       return {
         csv: text,
-        modelUsed: model,
+        modelUsed: modelName,
       };
-    } catch (error) {
-      console.error(`Modelo ${model} falló:`, error);
+    } catch (error: any) {
+      console.error(`Error con el modelo ${modelName}:`, error);
       lastError = error;
     }
   }
 
-  throw new Error("Todos los modelos fallaron. Último error: " + (lastError?.message || String(lastError)));
+  throw new Error(`Fallaron todos los modelos intentados (${triedModels.join(", ")}). Último error: ${lastError?.message || String(lastError)}`);
 }
