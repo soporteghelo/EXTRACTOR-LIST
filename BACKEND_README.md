@@ -40,12 +40,12 @@ function doPost(e) {
     participantes.forEach(function(p) {
       // Ajusta el orden de las columnas según tu documento
       sheet.appendRow([
+        p.Id,
         idRef, 
         p.ParticipanteDNI, 
         p.Participante, 
         p.Cargo, 
-        p.Area, 
-        new Date() // Fecha y hora de registro
+        p.Area
       ]);
     });
     

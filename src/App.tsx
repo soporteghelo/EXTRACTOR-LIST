@@ -83,12 +83,25 @@ export default function App() {
       }
       setSending(true);
       try {
-        const participantes = displayedData.map((row: ExtractedRow) => ({
-          ParticipanteDNI: row.dni,
-          Participante: row.nombre,
-          Cargo: row.ocupacion,
-          Area: row.area
-        }));
+        const participantes = displayedData
+          .filter((row: ExtractedRow) => !!getMasterInfo(row.dni))
+          .map((row: ExtractedRow) => {
+            const master = getMasterInfo(row.dni)!;
+            const uniqueId = "x" + Math.random().toString(36).substring(2, 8).toUpperCase();
+            return {
+              Id: uniqueId,
+              ParticipanteDNI: master.dni.toUpperCase(),
+              Participante: master.nombre.toUpperCase(),
+              Cargo: master.cargo.toUpperCase(),
+              Area: master.area.toUpperCase()
+            };
+          });
+
+        if (participantes.length === 0) {
+          alert("No hay participantes con coincidencias válidas para enviar.");
+          setSending(false);
+          return;
+        }
         const response = await fetch(GOOGLE_SHEETS_WEBAPP_URL, {
           method: "POST",
           headers: { "Content-Type": "text/plain;charset=utf-8" },
