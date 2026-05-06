@@ -156,6 +156,7 @@ export default function App() {
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  const [showOnlyErrors, setShowOnlyErrors] = useState(false);
 
   useEffect(() => {
     const fetchMaster = async () => {
@@ -328,17 +329,40 @@ export default function App() {
   }, [isPanning]);
   const handlePanEnd = () => setIsPanning(false);
 
+  // Touch Gestures State
+  const touchStartDistRef = useRef<number | null>(null);
+  const touchStartZoomRef = useRef<number>(1);
+
   const handleTouchStart = (e: React.TouchEvent) => {
     if (e.touches.length === 1) {
       setIsPanning(true);
       panStartRef.current = { x: e.touches[0].clientX - panOffset.x, y: e.touches[0].clientY - panOffset.y };
+      touchStartDistRef.current = null;
+    } else if (e.touches.length === 2) {
+      setIsPanning(false);
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      touchStartDistRef.current = Math.hypot(dx, dy);
+      touchStartZoomRef.current = zoomLevel;
     }
   };
+  
   const handleTouchMove = useCallback((e: React.TouchEvent) => {
-    if (!isPanning || e.touches.length !== 1) return;
-    setPanOffset({ x: e.touches[0].clientX - panStartRef.current.x, y: e.touches[0].clientY - panStartRef.current.y });
-  }, [isPanning]);
-  const handleTouchEnd = () => setIsPanning(false);
+    if (e.touches.length === 1 && isPanning) {
+      setPanOffset({ x: e.touches[0].clientX - panStartRef.current.x, y: e.touches[0].clientY - panStartRef.current.y });
+    } else if (e.touches.length === 2 && touchStartDistRef.current !== null) {
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      const currentDist = Math.hypot(dx, dy);
+      const scale = currentDist / touchStartDistRef.current;
+      setZoomLevel(Math.min(Math.max(touchStartZoomRef.current * scale, 0.5), 15));
+    }
+  }, [isPanning, zoomLevel]);
+
+  const handleTouchEnd = () => {
+    setIsPanning(false);
+    touchStartDistRef.current = null;
+  };
 
   const handleWheel = (e: React.WheelEvent) => {
     if (e.ctrlKey || e.metaKey || true) { // Always allow wheel zoom for better UX
@@ -359,6 +383,11 @@ export default function App() {
 
   const displayedData = useMemo(() => {
     let result = [...extractedData];
+    
+    if (showOnlyErrors) {
+      result = result.filter((r: ExtractedRow) => !getMasterInfo(r.dni));
+    }
+
     if (tableFilter) {
       const q = tableFilter.toLowerCase();
       result = result.filter((r: ExtractedRow) => r.nombre.toLowerCase().includes(q) || r.dni.toLowerCase().includes(q) || r.sourceFile.toLowerCase().includes(q));
@@ -499,10 +528,15 @@ export default function App() {
             <h2 className="text-lg font-semibold text-slate-800 hidden md:flex items-center gap-3">
               Panel de Resultados
               {extractedData.length > 0 && (
-                <div className="flex gap-2">
-                  <span className="text-xs font-bold bg-slate-100 text-slate-600 px-2.5 py-1 rounded-full">Total: {displayedData.length}</span>
-                  {displayedData.filter(r => !getMasterInfo(r.dni)).length > 0 && (
-                    <span className="text-xs font-bold bg-red-100 text-red-600 px-2.5 py-1 rounded-full">Sin Match: {displayedData.filter(r => !getMasterInfo(r.dni)).length}</span>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-bold bg-slate-100 text-slate-600 px-2.5 py-1 rounded-full">Total: {extractedData.length}</span>
+                  {extractedData.filter(r => !getMasterInfo(r.dni)).length > 0 && (
+                    <button 
+                      onClick={() => setShowOnlyErrors(!showOnlyErrors)}
+                      className={`text-xs font-bold px-2.5 py-1 rounded-full border transition-colors ${showOnlyErrors ? 'bg-red-600 text-white border-red-700' : 'bg-red-100 text-red-600 border-red-200 hover:bg-red-200'}`}
+                    >
+                      ⚠️ Sin Match: {extractedData.filter(r => !getMasterInfo(r.dni)).length}
+                    </button>
                   )}
                 </div>
               )}
@@ -510,10 +544,15 @@ export default function App() {
             <div className="md:hidden flex items-center gap-2">
               <span className="font-semibold text-slate-700 text-sm">Resultados</span>
               {extractedData.length > 0 && (
-                <div className="flex gap-1.5">
-                  <span className="text-[10px] font-bold bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full">{displayedData.length}</span>
-                  {displayedData.filter(r => !getMasterInfo(r.dni)).length > 0 && (
-                    <span className="text-[10px] font-bold bg-red-100 text-red-600 px-2 py-0.5 rounded-full">{displayedData.filter(r => !getMasterInfo(r.dni)).length} ⚠️</span>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[10px] font-bold bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full">{extractedData.length}</span>
+                  {extractedData.filter(r => !getMasterInfo(r.dni)).length > 0 && (
+                    <button 
+                      onClick={() => setShowOnlyErrors(!showOnlyErrors)}
+                      className={`text-[10px] font-bold px-2 py-0.5 rounded-full border transition-colors ${showOnlyErrors ? 'bg-red-600 text-white border-red-700' : 'bg-red-100 text-red-600 border-red-200'}`}
+                    >
+                      {extractedData.filter(r => !getMasterInfo(r.dni)).length} ⚠️
+                    </button>
                   )}
                 </div>
               )}
@@ -744,22 +783,23 @@ export default function App() {
             onWheel={handleWheel}
           >
             {/* Header Controls */}
-            <div className="absolute top-0 left-0 right-0 p-6 flex items-center justify-between bg-gradient-to-b from-black/50 to-transparent z-50 pointer-events-none">
-              <div className="flex items-center gap-4 pointer-events-auto">
-                <div className="p-2.5 bg-blue-600 text-white rounded-xl shadow-lg"><ImageIcon size={20} /></div>
-                <div>
-                  <h3 className="text-white font-semibold text-sm leading-tight">{viewingImage.name}</h3>
-                  <p className="text-slate-400 text-[10px] uppercase tracking-widest font-bold">Modo de Inspección de Alta Precisión</p>
+            <div className="absolute top-0 left-0 right-0 p-4 md:p-6 flex flex-wrap items-center justify-between bg-gradient-to-b from-black/60 via-black/40 to-transparent z-50 pointer-events-none gap-4">
+              <div className="flex items-center gap-3 pointer-events-auto">
+                <button onClick={() => setViewingImage(null)} className="md:hidden p-2.5 bg-white/10 backdrop-blur-xl text-white rounded-xl border border-white/20 shadow-2xl transition-all"><X size={24}/></button>
+                <div className="hidden md:flex p-2.5 bg-blue-600 text-white rounded-xl shadow-lg"><ImageIcon size={20} /></div>
+                <div className="flex-1 min-w-0">
+                  <h3 className="text-white font-semibold text-xs md:text-sm leading-tight truncate max-w-[150px] md:max-w-md">{viewingImage.name}</h3>
+                  <p className="text-slate-300 text-[9px] md:text-[10px] uppercase tracking-widest font-bold">Modo Inspección</p>
                 </div>
               </div>
-              <div className="flex items-center gap-2 pointer-events-auto">
-                <div className="flex items-center bg-white/10 backdrop-blur-xl rounded-2xl border border-white/20 p-1 mr-2 shadow-2xl">
-                  <button onClick={() => setZoomLevel(p => Math.max(0.5, p/1.2))} className="p-2.5 text-white/80 hover:text-white hover:bg-white/10 rounded-xl transition-all"><ZoomOut size={20}/></button>
-                  <div className="px-4 min-w-[70px] text-center"><span className="text-sm font-mono font-black text-blue-400">{(zoomLevel*100).toFixed(0)}%</span></div>
-                  <button onClick={() => setZoomLevel(p => Math.min(15, p*1.2))} className="p-2.5 text-white/80 hover:text-white hover:bg-white/10 rounded-xl transition-all"><ZoomIn size={20}/></button>
+              <div className="flex items-center gap-2 pointer-events-auto ml-auto">
+                <div className="flex items-center bg-white/10 backdrop-blur-xl rounded-xl md:rounded-2xl border border-white/20 p-1 mr-1 md:mr-2 shadow-2xl">
+                  <button onClick={() => setZoomLevel(p => Math.max(0.5, p/1.2))} className="p-1.5 md:p-2.5 text-white/80 hover:text-white hover:bg-white/10 rounded-lg md:rounded-xl transition-all"><ZoomOut size={16} className="md:w-5 md:h-5"/></button>
+                  <div className="px-2 md:px-4 min-w-[50px] md:min-w-[70px] text-center"><span className="text-xs md:text-sm font-mono font-black text-blue-400">{(zoomLevel*100).toFixed(0)}%</span></div>
+                  <button onClick={() => setZoomLevel(p => Math.min(15, p*1.2))} className="p-1.5 md:p-2.5 text-white/80 hover:text-white hover:bg-white/10 rounded-lg md:rounded-xl transition-all"><ZoomIn size={16} className="md:w-5 md:h-5"/></button>
                 </div>
-                <button onClick={resetViewer} className="p-3 bg-white/10 backdrop-blur-xl text-white/80 hover:text-white hover:bg-white/10 rounded-2xl border border-white/20 shadow-2xl transition-all" title="Reiniciar vista"><RotateCcw size={20}/></button>
-                <button onClick={() => setViewingImage(null)} className="ml-2 p-3 bg-red-500/20 text-red-400 hover:bg-red-500 hover:text-white rounded-2xl border border-red-500/30 shadow-2xl transition-all"><X size={24}/></button>
+                <button onClick={resetViewer} className="p-2 md:p-3 bg-white/10 backdrop-blur-xl text-white/80 hover:text-white hover:bg-white/10 rounded-xl md:rounded-2xl border border-white/20 shadow-2xl transition-all" title="Reiniciar vista"><RotateCcw size={16} className="md:w-5 md:h-5"/></button>
+                <button onClick={() => setViewingImage(null)} className="hidden md:block ml-2 p-3 bg-red-500/20 text-red-400 hover:bg-red-500 hover:text-white rounded-2xl border border-red-500/30 shadow-2xl transition-all"><X size={24}/></button>
               </div>
             </div>
 
