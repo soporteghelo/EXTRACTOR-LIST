@@ -496,8 +496,28 @@ export default function App() {
 
         <header className="flex-shrink-0 bg-white border-b border-slate-200 px-4 md:px-8 py-4 flex flex-col lg:flex-row items-start lg:items-center justify-between shadow-sm z-10 gap-4">
           <div className="flex items-center gap-4 w-full lg:w-auto justify-between">
-            <h2 className="text-lg font-semibold text-slate-800 hidden md:block">Panel de Resultados</h2>
-            <div className="md:hidden font-semibold text-slate-700">Resultados ({displayedData.length})</div>
+            <h2 className="text-lg font-semibold text-slate-800 hidden md:flex items-center gap-3">
+              Panel de Resultados
+              {extractedData.length > 0 && (
+                <div className="flex gap-2">
+                  <span className="text-xs font-bold bg-slate-100 text-slate-600 px-2.5 py-1 rounded-full">Total: {displayedData.length}</span>
+                  {displayedData.filter(r => !getMasterInfo(r.dni)).length > 0 && (
+                    <span className="text-xs font-bold bg-red-100 text-red-600 px-2.5 py-1 rounded-full">Sin Match: {displayedData.filter(r => !getMasterInfo(r.dni)).length}</span>
+                  )}
+                </div>
+              )}
+            </h2>
+            <div className="md:hidden flex items-center gap-2">
+              <span className="font-semibold text-slate-700 text-sm">Resultados</span>
+              {extractedData.length > 0 && (
+                <div className="flex gap-1.5">
+                  <span className="text-[10px] font-bold bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full">{displayedData.length}</span>
+                  {displayedData.filter(r => !getMasterInfo(r.dni)).length > 0 && (
+                    <span className="text-[10px] font-bold bg-red-100 text-red-600 px-2 py-0.5 rounded-full">{displayedData.filter(r => !getMasterInfo(r.dni)).length} ⚠️</span>
+                  )}
+                </div>
+              )}
+            </div>
             {extractedData.length > 0 && (
               <button onClick={tryFuzzyMatch} className="flex items-center gap-2 px-3 md:px-4 py-2 text-[10px] md:text-xs font-bold text-white bg-gradient-to-r from-blue-600 to-indigo-600 rounded-full hover:from-blue-700 hover:to-indigo-700 transition-all shadow-md active:scale-95 whitespace-nowrap">
                 <Sparkles size={14} /> <span className="hidden md:inline">Vincular por Nombre (IA)</span><span className="md:hidden">IA Link</span>
