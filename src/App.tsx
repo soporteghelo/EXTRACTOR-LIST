@@ -1,5 +1,5 @@
 // URL del Apps Script Web App (reemplaza por tu URL real)
-const GOOGLE_SHEETS_WEBAPP_URL = "URL_DE_TU_WEBAPP";
+const GOOGLE_SHEETS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbyohGM8PRErgAK4Uq_SXw0b4gQwuCqbV2O9CC64UAS1piAurb9oiZQ2kQiv4YwOn3GL/exec";
 // Función para resaltar coincidencias en texto
 function highlightMatch(text: string, query: string) {
   if (!query) return text;

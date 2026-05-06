@@ -43,3 +43,12 @@ Para que el despliegue funcione correctamente, debes configurar la variable en e
    ```bash
    npm run dev
    ```
+
+## 📊 Configuración del Backend y Google Sheets
+
+La aplicación incluye la funcionalidad de enviar los datos extraídos directamente hacia una base de datos en Google Sheets a través de Apps Script.
+
+Para aprender cómo configurar tu propio Google Apps Script, cómo desplegarlo como Web App y dónde actualizar el enlace de conexión en este proyecto, por favor revisa el documento de configuración dedicado:
+
+👉 [**Manual de Configuración del Backend (Apps Script)**](./BACKEND_README.md)
+
