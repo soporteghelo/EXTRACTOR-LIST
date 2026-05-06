@@ -28,8 +28,8 @@ Ejemplo de la función `doPost` que espera la aplicación:
 ```javascript
 function doPost(e) {
   try {
-    // IMPORTANTE: Cambia "Hoja1" por el nombre real de tu pestaña en Google Sheets
-    var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Hoja1"); 
+    // Selecciona la primera pestaña (hoja) del documento
+    var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheets()[0]; 
     
     // Parsear los datos que envía el frontend (React)
     var data = JSON.parse(e.postData.contents);

@@ -20,7 +20,7 @@ import {
   CheckCircle2, AlertCircle, FileDigit, Download, Settings, Loader2, 
   UserCheck, UserMinus, Search, SearchCode, Eye, ZoomIn, ZoomOut, Sparkles, 
   ArrowUpDown, ArrowUp, ArrowDown, Filter, ChevronDown, Check, Image as ImageIcon,
-  Maximize2, RotateCcw, MousePointer2, Grab
+  Maximize2, RotateCcw, MousePointer2, Grab, Menu
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { processDocuments } from "./lib/gemini";
@@ -155,6 +155,7 @@ export default function App() {
   const [openFilterMenu, setOpenFilterMenu] = useState<string | null>(null);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
   useEffect(() => {
     const fetchMaster = async () => {
@@ -327,6 +328,18 @@ export default function App() {
   }, [isPanning]);
   const handlePanEnd = () => setIsPanning(false);
 
+  const handleTouchStart = (e: React.TouchEvent) => {
+    if (e.touches.length === 1) {
+      setIsPanning(true);
+      panStartRef.current = { x: e.touches[0].clientX - panOffset.x, y: e.touches[0].clientY - panOffset.y };
+    }
+  };
+  const handleTouchMove = useCallback((e: React.TouchEvent) => {
+    if (!isPanning || e.touches.length !== 1) return;
+    setPanOffset({ x: e.touches[0].clientX - panStartRef.current.x, y: e.touches[0].clientY - panStartRef.current.y });
+  }, [isPanning]);
+  const handleTouchEnd = () => setIsPanning(false);
+
   const handleWheel = (e: React.WheelEvent) => {
     if (e.ctrlKey || e.metaKey || true) { // Always allow wheel zoom for better UX
       e.preventDefault();
@@ -409,13 +422,30 @@ export default function App() {
 
   return (
     <div className="flex h-screen w-full bg-slate-50 text-slate-800 font-sans overflow-hidden relative">
-      <aside className="w-[360px] flex-shrink-0 bg-white border-r border-slate-200 flex flex-col items-stretch overflow-hidden shadow-xl z-20">
-        <div className="px-6 py-6 border-b border-slate-100 flex items-center gap-3">
-          <div className="p-2 bg-blue-100 text-blue-600 rounded-lg"><FileDigit size={24} /></div>
-          <div>
-            <h1 className="font-semibold text-lg leading-tight text-slate-900">{APP_NAME}</h1>
-            <p className="text-xs text-slate-500 font-medium tracking-wide uppercase">{APP_SUBTITLE}</p>
+      
+      {/* Backdrop para móviles */}
+      <AnimatePresence>
+        {isMobileMenuOpen && (
+          <motion.div 
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            onClick={() => setIsMobileMenuOpen(false)}
+            className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-40 md:hidden"
+          />
+        )}
+      </AnimatePresence>
+
+      <aside className={`fixed inset-y-0 left-0 z-50 transform ${isMobileMenuOpen ? 'translate-x-0' : '-translate-x-full'} md:relative md:translate-x-0 w-[300px] md:w-[360px] flex-shrink-0 bg-white border-r border-slate-200 flex flex-col items-stretch overflow-hidden shadow-2xl md:shadow-xl transition-transform duration-300 ease-in-out`}>
+        <div className="px-6 py-6 border-b border-slate-100 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-blue-100 text-blue-600 rounded-lg"><FileDigit size={24} /></div>
+            <div>
+              <h1 className="font-semibold text-lg leading-tight text-slate-900">{APP_NAME}</h1>
+              <p className="text-xs text-slate-500 font-medium tracking-wide uppercase">{APP_SUBTITLE}</p>
+            </div>
           </div>
+          <button className="md:hidden p-2 text-slate-400 hover:text-slate-600 bg-slate-50 rounded-full" onClick={() => setIsMobileMenuOpen(false)}>
+            <X size={20} />
+          </button>
         </div>
         <div className="flex-1 overflow-y-auto p-6 scrollbar-hide">
           <div className="w-full border-2 border-dashed border-slate-300 rounded-2xl bg-slate-50/50 hover:bg-blue-50/50 hover:border-blue-400 transition-colors cursor-pointer group flex flex-col items-center justify-center p-8 mb-6" onClick={() => fileInputRef.current?.click()}>
@@ -450,36 +480,50 @@ export default function App() {
         </div>
       </aside>
 
-      <main className="flex-1 overflow-hidden flex flex-col bg-[#FAFAFA]">
-        <header className="h-[73px] flex-shrink-0 bg-white border-b border-slate-200 px-8 flex items-center justify-between shadow-sm z-10">
-          <div className="flex items-center gap-6">
-            <h2 className="text-lg font-semibold text-slate-800">Panel de Resultados</h2>
+      <main className="flex-1 overflow-hidden flex flex-col bg-[#FAFAFA] w-full">
+        {/* Cabecera Móvil */}
+        <div className="md:hidden bg-white border-b border-slate-200 px-4 py-3 flex items-center justify-between shadow-sm z-30 shrink-0">
+          <div className="flex items-center gap-3">
+            <button onClick={() => setIsMobileMenuOpen(true)} className="p-2 -ml-2 text-slate-600 bg-slate-50 rounded-lg">
+              <Menu size={24} />
+            </button>
+            <div className="flex items-center gap-2">
+              <FileDigit size={20} className="text-blue-600" />
+              <h1 className="font-bold text-slate-800">{APP_NAME}</h1>
+            </div>
+          </div>
+        </div>
+
+        <header className="flex-shrink-0 bg-white border-b border-slate-200 px-4 md:px-8 py-4 flex flex-col lg:flex-row items-start lg:items-center justify-between shadow-sm z-10 gap-4">
+          <div className="flex items-center gap-4 w-full lg:w-auto justify-between">
+            <h2 className="text-lg font-semibold text-slate-800 hidden md:block">Panel de Resultados</h2>
+            <div className="md:hidden font-semibold text-slate-700">Resultados ({displayedData.length})</div>
             {extractedData.length > 0 && (
-              <button onClick={tryFuzzyMatch} className="flex items-center gap-2 px-4 py-2 text-xs font-bold text-white bg-gradient-to-r from-blue-600 to-indigo-600 rounded-full hover:from-blue-700 hover:to-indigo-700 transition-all shadow-md active:scale-95">
-                <Sparkles size={14} /> Vincular por Nombre (IA)
+              <button onClick={tryFuzzyMatch} className="flex items-center gap-2 px-3 md:px-4 py-2 text-[10px] md:text-xs font-bold text-white bg-gradient-to-r from-blue-600 to-indigo-600 rounded-full hover:from-blue-700 hover:to-indigo-700 transition-all shadow-md active:scale-95 whitespace-nowrap">
+                <Sparkles size={14} /> <span className="hidden md:inline">Vincular por Nombre (IA)</span><span className="md:hidden">IA Link</span>
               </button>
             )}
           </div>
           {extractedData.length > 0 && (
-            <div className="flex items-center gap-3">
-              <div className="relative mr-4">
+            <div className="flex items-center gap-2 md:gap-3 w-full lg:w-auto overflow-x-auto pb-2 lg:pb-0 scrollbar-hide">
+              <div className="relative flex-shrink-0">
                 <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                <input placeholder="Filtro rápido..." value={tableFilter} onChange={(e) => setTableFilter(e.target.value)} className="pl-9 pr-4 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs outline-none focus:border-blue-400 focus:bg-white transition-all w-48" />
+                <input placeholder="Filtro..." value={tableFilter} onChange={(e) => setTableFilter(e.target.value)} className="pl-9 pr-4 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs outline-none focus:border-blue-400 focus:bg-white transition-all w-32 md:w-48" />
               </div>
-              <button onClick={() => navigator.clipboard.writeText(getCsvString())} className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors"><Copy size={16} /> Copiar</button>
+              <button onClick={() => navigator.clipboard.writeText(getCsvString())} className="flex-shrink-0 flex items-center gap-1.5 px-3 py-1.5 text-xs md:text-sm font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors"><Copy size={14} /> <span className="hidden md:inline">Copiar</span></button>
               <button onClick={() => {
                 const blob = new Blob([getCsvString()], { type: "text/csv;charset=utf-8;" });
                 const url = URL.createObjectURL(blob);
                 const link = document.createElement("a");
                 link.href = url; link.setAttribute("download", "participantes.csv"); link.click();
-              }} className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-white bg-slate-800 rounded-lg hover:bg-slate-900 transition-colors"><Download size={16} /> Descargar</button>
+              }} className="flex-shrink-0 flex items-center gap-1.5 px-3 py-1.5 text-xs md:text-sm font-medium text-white bg-slate-800 rounded-lg hover:bg-slate-900 transition-colors"><Download size={14} /> <span className="hidden md:inline">Descargar</span></button>
               <button
                 disabled={sending || displayedData.length === 0}
                 onClick={handleSendToSheets}
-                className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-white bg-green-600 rounded-lg hover:bg-green-700 transition-colors"
+                className="flex-shrink-0 flex items-center gap-1.5 px-3 py-1.5 text-xs md:text-sm font-medium text-white bg-green-600 rounded-lg hover:bg-green-700 transition-colors"
               >
-                {sending ? <Loader2 size={16} className="animate-spin" /> : <Database size={16} />}
-                Enviar a Sheets
+                {sending ? <Loader2 size={14} className="animate-spin" /> : <Database size={14} />}
+                <span className="hidden md:inline">Enviar a Sheets</span><span className="md:hidden">Sheets</span>
               </button>
             </div>
           )}
@@ -507,63 +551,122 @@ export default function App() {
           )}
 
           {extractedData.length > 0 && (
-            <div className="w-full bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden flex flex-col mb-20">
-              <div className="overflow-x-auto">
-                <table className="w-full text-left text-sm text-slate-600 border-collapse">
-                  <thead className="text-[11px] text-slate-500 bg-slate-50/80 sticky top-0 uppercase font-bold tracking-wider z-30">
-                    <tr>
-                      <th className="px-4 py-4 border-b border-slate-200">Nro</th>
-                      <th className="px-4 py-4 border-b border-slate-200 text-center">Ver</th>
-                      <HeaderCell label="Apellidos y Nombres" colKey="nombre" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("nombre")} isFiltered={(activeFilters["nombre"]?.length || 0) > 0} />
-                      <HeaderCell label="DNI" colKey="dni" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("dni")} isFiltered={(activeFilters["dni"]?.length || 0) > 0} />
-                      <HeaderCell label="Estado" colKey="estado" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("estado")} isFiltered={(activeFilters["estado"]?.length || 0) > 0} center />
-                      <HeaderCell label="Método" colKey="method" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("method")} isFiltered={(activeFilters["method"]?.length || 0) > 0} center />
-                      <HeaderCell label="Origen" colKey="sourceFile" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("sourceFile")} isFiltered={(activeFilters["sourceFile"]?.length || 0) > 0} />
-                      <th className="px-6 py-4 border-b border-slate-200 border-l border-slate-200 text-blue-600">DNI Sheets</th>
-                      <th className="px-6 py-4 border-b border-slate-200 text-blue-600">Nombre Oficial</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100 font-mono">
-                    {displayedData.map((row, idx) => {
-                      const master = getMasterInfo(row.dni);
-                      const isValid = !!master;
-                      return (
-                        <tr key={idx} className="hover:bg-slate-50/50 transition-colors group/row">
-                          <td className="px-4 py-3 text-slate-400">{row.nro}</td>
-                          <td className="px-4 py-3 text-center">
-                            <button onClick={() => handleViewSource(row.sourceFile)} className="p-1.5 text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"><Eye size={16} /></button>
-                          </td>
-                          <td className="px-6 py-3 truncate max-w-[180px] text-slate-800">{highlightMatch(row.nombre, tableFilter)}</td>
-                          <td className="px-6 py-3">
-                            <input type="text" value={row.dni} onChange={(e) => {
-                              const originalIdx = extractedData.findIndex(r => r === row);
-                              const updated = [...extractedData];
-                              updated[originalIdx].dni = e.target.value;
-                              updated[originalIdx].method = "MANUAL";
-                              setExtractedData(updated);
-                            }} className={`w-full px-2 py-1 rounded border outline-none transition-all font-mono text-sm ${isValid ? "bg-emerald-50 border-emerald-200 text-emerald-800" : "bg-red-50 border-red-200 text-red-800"}`} />
-                            {/* Resaltado visual en el input del DNI */}
-                            {tableFilter && row.dni.toLowerCase().includes(tableFilter.toLowerCase()) && (
-                              <div style={{ position: 'absolute', right: 8, top: 8, pointerEvents: 'none' }}>
-                                <mark style={{ background: '#ffe066', padding: 0 }}>{tableFilter}</mark>
-                              </div>
-                            )}
-                          </td>
-                          <td className="px-4 py-3 text-center">
-                            <span className={`inline-flex items-center px-2 py-1 rounded-full text-[10px] font-bold ${isValid ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"}`}>{isValid ? "OK" : "FUERA"}</span>
-                          </td>
-                          <td className="px-4 py-3 text-center">
-                            <span className={`inline-flex items-center px-2 py-0.5 rounded text-[9px] font-bold border ${row.method === "IA" ? "bg-purple-100 text-purple-700" : row.method === "MANUAL" ? "bg-amber-100 text-amber-700" : "bg-slate-100 text-slate-600"}`}>{row.method}</span>
-                          </td>
-                          <td className="px-6 py-3 text-[10px] text-slate-400 italic truncate max-w-[100px]">{row.sourceFile}</td>
-                          <td className="px-6 py-3 bg-slate-50/30 border-l border-slate-100 text-slate-500 italic">{master ? master.dni : "---"}</td>
-                          <td className="px-6 py-3 bg-slate-50/30 text-slate-600">{master ? master.nombre : "---"}</td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
+            <div className="w-full flex flex-col mb-20 md:mb-6">
+              
+              {/* VISTA MÓVIL: TARJETAS */}
+              <div className="md:hidden flex flex-col gap-4">
+                {displayedData.map((row, idx) => {
+                  const master = getMasterInfo(row.dni);
+                  const isValid = !!master;
+                  return (
+                    <div key={idx} className="bg-white rounded-2xl shadow-sm border border-slate-200 p-4 flex flex-col gap-3 relative overflow-hidden">
+                      <div className={`absolute top-0 left-0 w-1.5 h-full ${isValid ? 'bg-emerald-500' : 'bg-red-500'}`}></div>
+                      <div className="flex items-center justify-between pl-2 border-b border-slate-100 pb-2">
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs font-bold text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full">#{row.nro}</span>
+                          <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${isValid ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"}`}>{isValid ? "VÁLIDO" : "SIN MATCH"}</span>
+                        </div>
+                        <button onClick={() => handleViewSource(row.sourceFile)} className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-50 text-blue-600 hover:bg-blue-100 rounded-lg transition-colors text-xs font-bold"><Eye size={14} /> Ver Doc</button>
+                      </div>
+                      
+                      <div className="pl-2 flex flex-col gap-2">
+                        <div>
+                          <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-0.5">Apellidos y Nombres (Extraído)</p>
+                          <p className="text-sm font-semibold text-slate-800 leading-tight">{highlightMatch(row.nombre, tableFilter)}</p>
+                        </div>
+                        
+                        <div>
+                          <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-0.5">DNI</p>
+                          <input type="text" value={row.dni} onChange={(e) => {
+                            const originalIdx = extractedData.findIndex(r => r === row);
+                            const updated = [...extractedData];
+                            updated[originalIdx].dni = e.target.value;
+                            updated[originalIdx].method = "MANUAL";
+                            setExtractedData(updated);
+                          }} className={`w-full max-w-[200px] px-3 py-1.5 rounded-lg border outline-none transition-all font-mono text-sm ${isValid ? "bg-emerald-50 border-emerald-200 text-emerald-800" : "bg-red-50 border-red-200 text-red-800"}`} />
+                        </div>
+
+                        {isValid && (
+                          <div className="mt-2 bg-slate-50 rounded-xl p-3 border border-slate-100">
+                            <p className="text-[10px] text-blue-500 font-bold uppercase tracking-wider mb-1 flex items-center gap-1"><Database size={10}/> Datos Maestros</p>
+                            <p className="text-xs font-semibold text-slate-700 truncate">{master.nombre}</p>
+                            <div className="flex gap-2 mt-1">
+                                <span className="text-[10px] bg-white border border-slate-200 px-2 py-0.5 rounded text-slate-500 font-mono">{master.dni}</span>
+                                <span className="text-[10px] bg-white border border-slate-200 px-2 py-0.5 rounded text-slate-500 truncate">{master.cargo}</span>
+                            </div>
+                          </div>
+                        )}
+                        
+                        <div className="flex items-center justify-between mt-1">
+                          <span className="text-[9px] text-slate-400 italic truncate max-w-[150px]">{row.sourceFile}</span>
+                          <span className={`px-2 py-0.5 rounded text-[9px] font-bold border ${row.method === "IA" ? "bg-purple-100 text-purple-700" : row.method === "MANUAL" ? "bg-amber-100 text-amber-700" : "bg-slate-100 text-slate-600"}`}>{row.method}</span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
+
+              {/* VISTA ESCRITORIO: TABLA */}
+              <div className="hidden md:flex bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden flex-col">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-sm text-slate-600 border-collapse">
+                    <thead className="text-[11px] text-slate-500 bg-slate-50/80 sticky top-0 uppercase font-bold tracking-wider z-30">
+                      <tr>
+                        <th className="px-4 py-4 border-b border-slate-200">Nro</th>
+                        <th className="px-4 py-4 border-b border-slate-200 text-center">Ver</th>
+                        <HeaderCell label="Apellidos y Nombres" colKey="nombre" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("nombre")} isFiltered={(activeFilters["nombre"]?.length || 0) > 0} />
+                        <HeaderCell label="DNI" colKey="dni" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("dni")} isFiltered={(activeFilters["dni"]?.length || 0) > 0} />
+                        <HeaderCell label="Estado" colKey="estado" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("estado")} isFiltered={(activeFilters["estado"]?.length || 0) > 0} center />
+                        <HeaderCell label="Método" colKey="method" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("method")} isFiltered={(activeFilters["method"]?.length || 0) > 0} center />
+                        <HeaderCell label="Origen" colKey="sourceFile" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("sourceFile")} isFiltered={(activeFilters["sourceFile"]?.length || 0) > 0} />
+                        <th className="px-6 py-4 border-b border-slate-200 border-l border-slate-200 text-blue-600">DNI Sheets</th>
+                        <th className="px-6 py-4 border-b border-slate-200 text-blue-600">Nombre Oficial</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 font-mono">
+                      {displayedData.map((row, idx) => {
+                        const master = getMasterInfo(row.dni);
+                        const isValid = !!master;
+                        return (
+                          <tr key={idx} className="hover:bg-slate-50/50 transition-colors group/row">
+                            <td className="px-4 py-3 text-slate-400">{row.nro}</td>
+                            <td className="px-4 py-3 text-center">
+                              <button onClick={() => handleViewSource(row.sourceFile)} className="p-1.5 text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"><Eye size={16} /></button>
+                            </td>
+                            <td className="px-6 py-3 truncate max-w-[180px] text-slate-800">{highlightMatch(row.nombre, tableFilter)}</td>
+                            <td className="px-6 py-3">
+                              <input type="text" value={row.dni} onChange={(e) => {
+                                const originalIdx = extractedData.findIndex(r => r === row);
+                                const updated = [...extractedData];
+                                updated[originalIdx].dni = e.target.value;
+                                updated[originalIdx].method = "MANUAL";
+                                setExtractedData(updated);
+                              }} className={`w-full px-2 py-1 rounded border outline-none transition-all font-mono text-sm ${isValid ? "bg-emerald-50 border-emerald-200 text-emerald-800" : "bg-red-50 border-red-200 text-red-800"}`} />
+                              {/* Resaltado visual en el input del DNI */}
+                              {tableFilter && row.dni.toLowerCase().includes(tableFilter.toLowerCase()) && (
+                                <div style={{ position: 'absolute', right: 8, top: 8, pointerEvents: 'none' }}>
+                                  <mark style={{ background: '#ffe066', padding: 0 }}>{tableFilter}</mark>
+                                </div>
+                              )}
+                            </td>
+                            <td className="px-4 py-3 text-center">
+                              <span className={`inline-flex items-center px-2 py-1 rounded-full text-[10px] font-bold ${isValid ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"}`}>{isValid ? "OK" : "FUERA"}</span>
+                            </td>
+                            <td className="px-4 py-3 text-center">
+                              <span className={`inline-flex items-center px-2 py-0.5 rounded text-[9px] font-bold border ${row.method === "IA" ? "bg-purple-100 text-purple-700" : row.method === "MANUAL" ? "bg-amber-100 text-amber-700" : "bg-slate-100 text-slate-600"}`}>{row.method}</span>
+                            </td>
+                            <td className="px-6 py-3 text-[10px] text-slate-400 italic truncate max-w-[100px]">{row.sourceFile}</td>
+                            <td className="px-6 py-3 bg-slate-50/30 border-l border-slate-100 text-slate-500 italic">{master ? master.dni : "---"}</td>
+                            <td className="px-6 py-3 bg-slate-50/30 text-slate-600">{master ? master.nombre : "---"}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
             </div>
           )}
 
@@ -642,11 +745,14 @@ export default function App() {
 
             {/* Interaction Canvas */}
             <div 
-              className={`relative w-full h-full flex items-center justify-center overflow-hidden cursor-${isPanning ? 'grabbing' : 'grab'}`}
+              className={`relative w-full h-full flex items-center justify-center overflow-hidden cursor-${isPanning ? 'grabbing' : 'grab'} touch-none`}
               onMouseDown={handlePanStart}
               onMouseMove={handlePanMove}
               onMouseUp={handlePanEnd}
               onMouseLeave={handlePanEnd}
+              onTouchStart={handleTouchStart}
+              onTouchMove={handleTouchMove}
+              onTouchEnd={handleTouchEnd}
             >
               <motion.img 
                 src={viewingImage.url} 
