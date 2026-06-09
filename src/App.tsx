@@ -10,6 +10,18 @@ function highlightMatch(text: string, query: string) {
     ) : part
   );
 }
+function highlightSearchMatch(text: string, query: string): React.ReactNode {
+  if (!query.trim()) return text;
+  const tokens = query.trim().split(/\s+/).filter(t => t.length >= 2);
+  if (tokens.length === 0) return text;
+  const escaped = tokens.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  const parts = text.split(new RegExp(`(${escaped})`, "gi"));
+  return parts.map((part, i) =>
+    i % 2 === 1
+      ? <mark key={i} style={{ background: "#bfdbfe", padding: 0, borderRadius: 2, fontWeight: 700 }}>{part}</mark>
+      : part
+  );
+}
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -25,6 +37,7 @@ import {
 import { motion, AnimatePresence } from "motion/react";
 import { processDocuments } from "./lib/gemini";
 import { APP_NAME, APP_SUBTITLE, MASTER_DATA_URL } from "./config";
+import { normalizeDniStrict, nameMatchScore, dniFuzzyScore, confidenceLevel, normalizeText } from "./lib/matching";
 
 interface DocumentFile {
   id: string;
@@ -38,6 +51,7 @@ interface DocumentFile {
 type MatchMethod = "DEFAULT" | "MANUAL" | "IA";
 
 interface ExtractedRow {
+  id: string;
   nro: string;
   nombre: string;
   dni: string;
@@ -45,6 +59,8 @@ interface ExtractedRow {
   area: string;
   sourceFile: string;
   method: MatchMethod;
+  matchConfidence?: number;
+  matchCandidates?: { master: MasterRow; score: number }[];
 }
 
 interface MasterRow {
@@ -141,6 +157,7 @@ export default function App() {
   
   const [showSearch, setShowSearch] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
+  const [copiedDni, setCopiedDni] = useState<string | null>(null);
   
   // Viewer state
   const [viewingImage, setViewingImage] = useState<{ url: string, name: string } | null>(null);
@@ -157,6 +174,12 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [showOnlyErrors, setShowOnlyErrors] = useState(false);
+  const [activeCandidateRow, setActiveCandidateRow] = useState<number | null>(null);
+  const [editingRowId, setEditingRowId] = useState<string | null>(null);
+  const [colWidths, setColWidths] = useState<Record<string, number>>({
+    nro: 60, ver: 60, nombre: 200, dni: 130, estado: 80, method: 110, sourceFile: 130, dniSheets: 130, nombreOficial: 220
+  });
+  const resizingRef = useRef<{ col: string; startX: number; startWidth: number } | null>(null);
 
   useEffect(() => {
     const fetchMaster = async () => {
@@ -181,10 +204,30 @@ export default function App() {
     fetchMaster();
   }, []);
 
-  const normalizeDni = (dni: string) => dni.toString().replace(/^0+/, "").trim();
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!resizingRef.current) return;
+      const { col, startX, startWidth } = resizingRef.current;
+      const diff = e.clientX - startX;
+      setColWidths(prev => ({ ...prev, [col]: Math.max(50, startWidth + diff) }));
+    };
+    const handleMouseUp = () => { resizingRef.current = null; };
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, []);
+
+  const handleResizeStart = (col: string, clientX: number, currentWidth: number) => {
+    resizingRef.current = { col, startX: clientX, startWidth: currentWidth };
+  };
+
   const getMasterInfo = (dni: string) => {
-    const normalized = normalizeDni(dni);
-    return masterData.find((m: MasterRow) => normalizeDni(m.dni) === normalized);
+    const normalized = normalizeDniStrict(dni);
+    if (!normalized) return undefined;
+    return masterData.find((m: MasterRow) => normalizeDniStrict(m.dni) === normalized);
   };
 
   const handleFilesAdded = async (newFiles: FileList | null) => {
@@ -227,9 +270,10 @@ export default function App() {
       const inputFormats = files.map((f) => ({ data: f.base64, mimeType: f.mimeType, name: f.name }));
       const result = await processDocuments(inputFormats);
       const rows = result.csv.split('\n').slice(1);
-      const parsed: ExtractedRow[] = rows.map((row: string) => {
+      const parsed: ExtractedRow[] = rows.map((row: string, rowIndex: number) => {
         const cols = row.split(';');
         return {
+          id: `r${rowIndex}_${Date.now()}`,
           nro: cols[0] || "", nombre: cols[1] || "", dni: cols[2] || "",
           ocupacion: cols[3] || "", area: cols[4] || "", sourceFile: cols[5]?.trim() || "",
           method: "DEFAULT" as MatchMethod
@@ -245,58 +289,72 @@ export default function App() {
     }
   };
 
-  // Levenshtein distance para similitud de cadenas
-  function levenshtein(a: string, b: string) {
-    const an = a ? a.length : 0;
-    const bn = b ? b.length : 0;
-    if (an === 0) return bn;
-    if (bn === 0) return an;
-    const matrix = Array.from({ length: an + 1 }, () => Array(bn + 1).fill(0));
-    for (let i = 0; i <= an; i++) matrix[i][0] = i;
-    for (let j = 0; j <= bn; j++) matrix[0][j] = j;
-    for (let i = 1; i <= an; i++) {
-      for (let j = 1; j <= bn; j++) {
-        const cost = a[i - 1].toLowerCase() === b[j - 1].toLowerCase() ? 0 : 1;
-        matrix[i][j] = Math.min(
-          matrix[i - 1][j] + 1,
-          matrix[i][j - 1] + 1,
-          matrix[i - 1][j - 1] + cost
-        );
-      }
-    }
-    return matrix[an][bn];
-  }
-
-  // Mejor reconocimiento de coincidencias por IA
+  // Matching multicapa: Pasada 1 → DNI fuzzy, Pasada 2 → Nombre compuesto
   const tryFuzzyMatch = () => {
     const updated = [...extractedData];
     let matchesFound = 0;
+    let suggestionsFound = 0;
+
+    // Pasada 1: DNI fuzzy (1 dígito OCR erróneo tolerado)
     updated.forEach((row: ExtractedRow, idx: number) => {
-      if (!getMasterInfo(row.dni)) {
-        const query = row.nombre.toLowerCase().trim();
-        if (query.length < 4) return;
-        // Buscar mejor coincidencia por similitud de Levenshtein
-        let bestMatch: MasterRow | null = null;
-        let bestScore = Infinity;
-        masterData.forEach((m: MasterRow) => {
-          const score = levenshtein(query, m.nombre.toLowerCase());
-          if (score < bestScore) {
-            bestScore = score;
-            bestMatch = m;
-          }
-        });
-        // Si la similitud es suficientemente alta (ajustar umbral según necesidad)
-        if (bestMatch && bestScore <= Math.max(3, Math.floor(query.length * 0.25))) {
-          updated[idx].dni = bestMatch.dni;
-          updated[idx].method = "IA" as MatchMethod;
-          matchesFound++;
-        }
+      if (getMasterInfo(row.dni)) return;
+      if (!row.dni || row.dni.length < 6) return;
+      let bestMatch: MasterRow | null = null;
+      let bestScore = 0;
+      masterData.forEach((m: MasterRow) => {
+        const score = dniFuzzyScore(row.dni, m.dni);
+        if (score > bestScore) { bestScore = score; bestMatch = m; }
+      });
+      if (bestMatch && bestScore >= 0.875) {
+        updated[idx] = { ...updated[idx], dni: bestMatch.dni, method: "IA" as MatchMethod, matchConfidence: bestScore, matchCandidates: undefined };
+        matchesFound++;
       }
     });
-    if (matchesFound > 0) {
-      setExtractedData(updated);
-      alert(`Se encontraron ${matchesFound} coincidencias por nombre (IA mejorada).`);
-    } else alert("No se encontraron nuevas coincidencias.");
+
+    // Pasada 2: Nombre compuesto (Jaro-Winkler + token-set, agnóstico al orden)
+    updated.forEach((row: ExtractedRow, idx: number) => {
+      if (getMasterInfo(row.dni)) return;
+      if (!row.nombre || row.nombre.length < 4) return;
+
+      const candidates: { master: MasterRow; score: number }[] = [];
+      masterData.forEach((m: MasterRow) => {
+        const score = nameMatchScore(row.nombre, m.nombre);
+        if (score >= 0.60) candidates.push({ master: m, score });
+      });
+      candidates.sort((a, b) => b.score - a.score);
+      const top3 = candidates.slice(0, 3);
+
+      if (top3.length === 0) return;
+
+      const best = top3[0];
+      if (best.score >= 0.78) {
+        updated[idx] = { ...updated[idx], dni: best.master.dni, method: "IA" as MatchMethod, matchConfidence: best.score, matchCandidates: top3 };
+        matchesFound++;
+      } else {
+        updated[idx] = { ...updated[idx], matchCandidates: top3 };
+        suggestionsFound++;
+      }
+    });
+
+    setExtractedData(updated);
+    if (matchesFound > 0 || suggestionsFound > 0) {
+      const parts = [];
+      if (matchesFound > 0) parts.push(`${matchesFound} coincidencias aplicadas`);
+      if (suggestionsFound > 0) parts.push(`${suggestionsFound} sugerencias para revisar`);
+      alert(parts.join(" · ") + ".");
+    } else {
+      alert("No se encontraron nuevas coincidencias.");
+    }
+  };
+
+  const acceptAllHighConfidence = () => {
+    const updated = extractedData.map((row: ExtractedRow) => {
+      if (row.method === "IA" && row.matchConfidence != null && row.matchConfidence >= 0.92 && !getMasterInfo(row.dni)) {
+        return { ...row, method: "MANUAL" as MatchMethod };
+      }
+      return row;
+    });
+    setExtractedData(updated);
   };
 
   const getCsvString = () => {
@@ -385,7 +443,7 @@ export default function App() {
     let result = [...extractedData];
     
     if (showOnlyErrors) {
-      result = result.filter((r: ExtractedRow) => !getMasterInfo(r.dni));
+      result = result.filter((r: ExtractedRow) => !getMasterInfo(r.dni) || r.id === editingRowId);
     }
 
     if (tableFilter) {
@@ -423,7 +481,7 @@ export default function App() {
       });
     }
     return result;
-  }, [extractedData, tableFilter, sortConfig, activeFilters]);
+  }, [extractedData, tableFilter, sortConfig, activeFilters, showOnlyErrors, masterData, editingRowId]);
 
   const toggleSort = (key: string) => setSortConfig((prev: { key: string, direction: 'asc' | 'desc' } | null) => (prev?.key === key && prev.direction === 'asc') ? { key, direction: 'desc' } : { key, direction: 'asc' });
   const toggleFilterValue = (column: string, value: string) => setActiveFilters((prev: { [key: string]: string[] }) => {
@@ -432,21 +490,79 @@ export default function App() {
     return { ...prev, [column]: updated };
   });
 
-  const getUniqueValues = (column: string) => {
+  const getUniqueValues = (column: string): string[] => {
     if (column === "estado") return ["OK", "FUERA"];
     const values = extractedData.map((r: ExtractedRow) => r[column as keyof ExtractedRow] as string);
-    return Array.from(new Set(values)).filter(Boolean).sort();
+    return Array.from(new Set(values)).filter((v): v is string => !!v).sort();
   };
 
-  const searchResults = useMemo(() => {
-    if (!searchQuery.trim()) return [];
-    const query = searchQuery.toLowerCase().trim();
-    const normalizedQuery = normalizeDni(query);
-    return masterData.filter((m: MasterRow) => {
-      const nameMatch = m.nombre.toLowerCase().includes(query);
-      const dniMatch = normalizeDni(m.dni).includes(normalizedQuery);
-      return nameMatch || dniMatch;
-    }).slice(0, 10);
+  const searchResults = useMemo((): { master: MasterRow; score: number; matchType: string }[] => {
+    const q = searchQuery.trim();
+    if (!q) return [];
+
+    const qNorm = normalizeText(q);
+    const qNormDni = normalizeDniStrict(q);
+    const qTokens = qNorm.split(/\s+/).filter((t: string) => t.length >= 2);
+
+    const scored: { master: MasterRow; score: number; matchType: string }[] = [];
+
+    for (const m of masterData) {
+      const nameNorm = normalizeText(m.nombre);
+      const dniNorm = normalizeDniStrict(m.dni);
+      const nameWords = nameNorm.split(/\s+/);
+
+      // --- DNI matches (highest priority) ---
+      if (qNormDni.length >= 3) {
+        if (dniNorm === qNormDni) {
+          scored.push({ master: m, score: 2.0, matchType: 'dni_exact' });
+          continue;
+        }
+        if (dniNorm.startsWith(qNormDni)) {
+          scored.push({ master: m, score: 1.8 - (8 - qNormDni.length) * 0.05, matchType: 'dni_partial' });
+          continue;
+        }
+        if (qNormDni.length >= 4 && dniNorm.includes(qNormDni)) {
+          scored.push({ master: m, score: 1.3, matchType: 'dni_partial' });
+          continue;
+        }
+      }
+
+      // --- Name matches ---
+      if (qTokens.length > 0) {
+        // All tokens match word-start (best name result)
+        const allWordStart = qTokens.every((t: string) => nameWords.some((w: string) => w.startsWith(t)));
+        if (allWordStart) {
+          scored.push({ master: m, score: 1.1 + (qTokens.length > 1 ? 0.15 : 0), matchType: 'name' });
+          continue;
+        }
+        // All tokens present anywhere (order-agnostic contains)
+        const allContain = qTokens.every((t: string) => nameNorm.includes(t));
+        if (allContain) {
+          scored.push({ master: m, score: 0.85 + (qTokens.length > 1 ? 0.10 : 0), matchType: 'name' });
+          continue;
+        }
+        // At least one token matches word-start (partial multi-word)
+        if (qTokens.some((t: string) => t.length >= 3 && nameWords.some((w: string) => w.startsWith(t)))) {
+          scored.push({ master: m, score: 0.60, matchType: 'name' });
+          continue;
+        }
+        // At least one token is contained
+        if (qTokens.some((t: string) => t.length >= 3 && nameNorm.includes(t))) {
+          scored.push({ master: m, score: 0.40, matchType: 'name' });
+          continue;
+        }
+      }
+
+      // Fuzzy fallback for longer queries
+      if (qNorm.length >= 5) {
+        const fuzzy = nameMatchScore(q, m.nombre);
+        if (fuzzy >= 0.62) {
+          scored.push({ master: m, score: fuzzy * 0.50, matchType: 'fuzzy' });
+        }
+      }
+    }
+
+    return scored.sort((a, b) => b.score - a.score).slice(0, 15);
   }, [searchQuery, masterData]);
 
   return (
@@ -531,12 +647,17 @@ export default function App() {
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-bold bg-slate-100 text-slate-600 px-2.5 py-1 rounded-full">Total: {extractedData.length}</span>
                   {extractedData.filter(r => !getMasterInfo(r.dni)).length > 0 && (
-                    <button 
+                    <button
                       onClick={() => setShowOnlyErrors(!showOnlyErrors)}
                       className={`text-xs font-bold px-2.5 py-1 rounded-full border transition-colors ${showOnlyErrors ? 'bg-red-600 text-white border-red-700' : 'bg-red-100 text-red-600 border-red-200 hover:bg-red-200'}`}
                     >
                       ⚠️ Sin Match: {extractedData.filter(r => !getMasterInfo(r.dni)).length}
                     </button>
+                  )}
+                  {extractedData.filter(r => !getMasterInfo(r.dni) && r.matchCandidates && r.matchCandidates.length > 0).length > 0 && (
+                    <span className="text-xs font-bold bg-amber-100 text-amber-700 px-2.5 py-1 rounded-full border border-amber-200">
+                      💡 Sugerencias: {extractedData.filter(r => !getMasterInfo(r.dni) && r.matchCandidates && r.matchCandidates.length > 0).length}
+                    </span>
                   )}
                 </div>
               )}
@@ -558,9 +679,16 @@ export default function App() {
               )}
             </div>
             {extractedData.length > 0 && (
-              <button onClick={tryFuzzyMatch} className="flex items-center gap-2 px-3 md:px-4 py-2 text-[10px] md:text-xs font-bold text-white bg-gradient-to-r from-blue-600 to-indigo-600 rounded-full hover:from-blue-700 hover:to-indigo-700 transition-all shadow-md active:scale-95 whitespace-nowrap">
-                <Sparkles size={14} /> <span className="hidden md:inline">Vincular por Nombre (IA)</span><span className="md:hidden">IA Link</span>
-              </button>
+              <div className="flex items-center gap-2">
+                <button onClick={tryFuzzyMatch} className="flex items-center gap-2 px-3 md:px-4 py-2 text-[10px] md:text-xs font-bold text-white bg-gradient-to-r from-blue-600 to-indigo-600 rounded-full hover:from-blue-700 hover:to-indigo-700 transition-all shadow-md active:scale-95 whitespace-nowrap">
+                  <Sparkles size={14} /> <span className="hidden md:inline">Vincular por Nombre (IA)</span><span className="md:hidden">IA Link</span>
+                </button>
+                {extractedData.some(r => r.method === "IA" && r.matchConfidence != null && r.matchConfidence >= 0.92) && (
+                  <button onClick={acceptAllHighConfidence} className="flex items-center gap-1.5 px-3 py-2 text-[10px] md:text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-full transition-all shadow-md active:scale-95 whitespace-nowrap">
+                    <Check size={14} /> <span className="hidden md:inline">Aceptar Alta Confianza</span><span className="md:hidden">✓ AC</span>
+                  </button>
+                )}
+              </div>
             )}
           </div>
           {extractedData.length > 0 && (
@@ -618,7 +746,7 @@ export default function App() {
                   const master = getMasterInfo(row.dni);
                   const isValid = !!master;
                   return (
-                    <div key={idx} className="bg-white rounded-2xl shadow-sm border border-slate-200 p-4 flex flex-col gap-3 relative overflow-hidden">
+                    <div key={row.id} className="bg-white rounded-2xl shadow-sm border border-slate-200 p-4 flex flex-col gap-3 relative overflow-hidden">
                       <div className={`absolute top-0 left-0 w-1.5 h-full ${isValid ? 'bg-emerald-500' : 'bg-red-500'}`}></div>
                       <div className="flex items-center justify-between pl-2 border-b border-slate-100 pb-2">
                         <div className="flex items-center gap-2">
@@ -637,12 +765,9 @@ export default function App() {
                         <div>
                           <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-0.5">DNI</p>
                           <input type="text" value={row.dni} onChange={(e) => {
-                            const originalIdx = extractedData.findIndex(r => r === row);
-                            const updated = [...extractedData];
-                            updated[originalIdx].dni = e.target.value;
-                            updated[originalIdx].method = "MANUAL";
+                            const updated = extractedData.map(r => r.id === row.id ? { ...r, dni: e.target.value, method: "MANUAL" as MatchMethod } : r);
                             setExtractedData(updated);
-                          }} className={`w-full max-w-[200px] px-3 py-1.5 rounded-lg border outline-none transition-all font-mono text-sm ${isValid ? "bg-emerald-50 border-emerald-200 text-emerald-800" : "bg-red-50 border-red-200 text-red-800"}`} />
+                          }} onFocus={() => setEditingRowId(row.id)} onBlur={() => setEditingRowId(null)} className={`w-full max-w-[200px] px-3 py-1.5 rounded-lg border outline-none transition-all font-mono text-sm ${isValid ? "bg-emerald-50 border-emerald-200 text-emerald-800" : "bg-red-50 border-red-200 text-red-800"}`} />
                         </div>
 
                         {isValid && (
@@ -656,9 +781,49 @@ export default function App() {
                           </div>
                         )}
                         
+                        {!isValid && row.matchCandidates && row.matchCandidates.length > 0 && (
+                          <div className="relative">
+                            <button
+                              onClick={() => setActiveCandidateRow(activeCandidateRow === idx ? null : idx)}
+                              className="text-[10px] font-bold text-amber-700 bg-amber-50 border border-amber-200 px-2 py-1 rounded-lg hover:bg-amber-100 transition-colors"
+                            >
+                              💡 {row.matchCandidates.length} sugerencia{row.matchCandidates.length > 1 ? "s" : ""}
+                            </button>
+                            {activeCandidateRow === idx && (
+                              <div className="absolute left-0 top-full mt-1 z-50 bg-white border border-amber-200 rounded-xl shadow-lg p-2 min-w-[240px]">
+                                {row.matchCandidates.map((c, ci) => (
+                                  <button key={ci} onClick={() => {
+                                    const updated = extractedData.map(r => r.id === row.id ? { ...r, dni: c.master.dni, method: "IA" as MatchMethod, matchConfidence: c.score } : r);
+                                    setExtractedData(updated);
+                                    setActiveCandidateRow(null);
+                                  }} className="w-full text-left px-3 py-2 hover:bg-amber-50 rounded-lg transition-colors">
+                                    <div className="flex items-center justify-between gap-2">
+                                      <span className="text-xs font-semibold text-slate-800 truncate">{c.master.nombre}</span>
+                                      <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0 ${confidenceLevel(c.score) === "high" ? "bg-emerald-100 text-emerald-700" : confidenceLevel(c.score) === "medium" ? "bg-amber-100 text-amber-700" : "bg-red-100 text-red-700"}`}>{Math.round(c.score * 100)}%</span>
+                                    </div>
+                                    <span className="text-[10px] text-slate-400 font-mono">{c.master.dni}</span>
+                                  </button>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
                         <div className="flex items-center justify-between mt-1">
                           <span className="text-[9px] text-slate-400 italic truncate max-w-[150px]">{row.sourceFile}</span>
-                          <span className={`px-2 py-0.5 rounded text-[9px] font-bold border ${row.method === "IA" ? "bg-purple-100 text-purple-700" : row.method === "MANUAL" ? "bg-amber-100 text-amber-700" : "bg-slate-100 text-slate-600"}`}>{row.method}</span>
+                          <span className={`px-2 py-0.5 rounded text-[9px] font-bold border ${
+                            row.method === "IA"
+                              ? row.matchConfidence != null && confidenceLevel(row.matchConfidence) === "high"
+                                ? "bg-emerald-100 text-emerald-700 border-emerald-200"
+                                : row.matchConfidence != null && confidenceLevel(row.matchConfidence) === "medium"
+                                  ? "bg-amber-100 text-amber-700 border-amber-200"
+                                  : "bg-purple-100 text-purple-700 border-purple-200"
+                              : row.method === "MANUAL" ? "bg-amber-100 text-amber-700 border-amber-200" : "bg-slate-100 text-slate-600 border-slate-200"
+                          }`}>
+                            {row.method === "IA" && row.matchConfidence != null
+                              ? `IA ${Math.round(row.matchConfidence * 100)}%`
+                              : row.method}
+                          </span>
                         </div>
                       </div>
                     </div>
@@ -669,18 +834,18 @@ export default function App() {
               {/* VISTA ESCRITORIO: TABLA */}
               <div className="hidden md:flex bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden flex-col">
                 <div className="overflow-x-auto">
-                  <table className="w-full text-left text-sm text-slate-600 border-collapse">
+                  <table className="min-w-full text-left text-sm text-slate-600 border-collapse table-fixed">
                     <thead className="text-[11px] text-slate-500 bg-slate-50/80 sticky top-0 uppercase font-bold tracking-wider z-30">
                       <tr>
-                        <th className="px-4 py-4 border-b border-slate-200">Nro</th>
-                        <th className="px-4 py-4 border-b border-slate-200 text-center">Ver</th>
-                        <HeaderCell label="Apellidos y Nombres" colKey="nombre" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("nombre")} isFiltered={(activeFilters["nombre"]?.length || 0) > 0} />
-                        <HeaderCell label="DNI" colKey="dni" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("dni")} isFiltered={(activeFilters["dni"]?.length || 0) > 0} />
-                        <HeaderCell label="Estado" colKey="estado" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("estado")} isFiltered={(activeFilters["estado"]?.length || 0) > 0} center />
-                        <HeaderCell label="Método" colKey="method" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("method")} isFiltered={(activeFilters["method"]?.length || 0) > 0} center />
-                        <HeaderCell label="Origen" colKey="sourceFile" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("sourceFile")} isFiltered={(activeFilters["sourceFile"]?.length || 0) > 0} />
-                        <th className="px-6 py-4 border-b border-slate-200 border-l border-slate-200 text-blue-600">DNI Sheets</th>
-                        <th className="px-6 py-4 border-b border-slate-200 text-blue-600">Nombre Oficial</th>
+                        <th className="px-4 py-4 border-b border-slate-200 relative group/th" style={{ width: colWidths.nro, minWidth: 50 }}>Nro<div className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-blue-400 opacity-0 group-hover/th:opacity-100 transition-opacity z-10" onMouseDown={(e) => { e.preventDefault(); handleResizeStart('nro', e.clientX, colWidths.nro); }} /></th>
+                        <th className="px-4 py-4 border-b border-slate-200 text-center relative group/th" style={{ width: colWidths.ver, minWidth: 50 }}>Ver<div className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-blue-400 opacity-0 group-hover/th:opacity-100 transition-opacity z-10" onMouseDown={(e) => { e.preventDefault(); handleResizeStart('ver', e.clientX, colWidths.ver); }} /></th>
+                        <HeaderCell label="Apellidos y Nombres" colKey="nombre" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("nombre")} isFiltered={(activeFilters["nombre"]?.length || 0) > 0} width={colWidths.nombre} onResizeStart={handleResizeStart} />
+                        <HeaderCell label="DNI" colKey="dni" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("dni")} isFiltered={(activeFilters["dni"]?.length || 0) > 0} width={colWidths.dni} onResizeStart={handleResizeStart} />
+                        <HeaderCell label="Estado" colKey="estado" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("estado")} isFiltered={(activeFilters["estado"]?.length || 0) > 0} center width={colWidths.estado} onResizeStart={handleResizeStart} />
+                        <HeaderCell label="Método" colKey="method" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("method")} isFiltered={(activeFilters["method"]?.length || 0) > 0} center width={colWidths.method} onResizeStart={handleResizeStart} />
+                        <HeaderCell label="Origen" colKey="sourceFile" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("sourceFile")} isFiltered={(activeFilters["sourceFile"]?.length || 0) > 0} width={colWidths.sourceFile} onResizeStart={handleResizeStart} />
+                        <th className="px-6 py-4 border-b border-slate-200 border-l border-slate-200 text-blue-600 relative group/th" style={{ width: colWidths.dniSheets, minWidth: 50 }}>DNI Sheets<div className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-blue-400 opacity-0 group-hover/th:opacity-100 transition-opacity z-10" onMouseDown={(e) => { e.preventDefault(); handleResizeStart('dniSheets', e.clientX, colWidths.dniSheets); }} /></th>
+                        <th className="px-6 py-4 border-b border-slate-200 text-blue-600 relative group/th" style={{ width: colWidths.nombreOficial, minWidth: 50 }}>Nombre Oficial<div className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-blue-400 opacity-0 group-hover/th:opacity-100 transition-opacity z-10" onMouseDown={(e) => { e.preventDefault(); handleResizeStart('nombreOficial', e.clientX, colWidths.nombreOficial); }} /></th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 font-mono">
@@ -688,7 +853,7 @@ export default function App() {
                         const master = getMasterInfo(row.dni);
                         const isValid = !!master;
                         return (
-                          <tr key={idx} className="hover:bg-slate-50/50 transition-colors group/row">
+                          <tr key={row.id} className="hover:bg-slate-50/50 transition-colors group/row">
                             <td className="px-4 py-3 text-slate-400">{row.nro}</td>
                             <td className="px-4 py-3 text-center">
                               <button onClick={() => handleViewSource(row.sourceFile)} className="p-1.5 text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"><Eye size={16} /></button>
@@ -696,12 +861,9 @@ export default function App() {
                             <td className="px-6 py-3 truncate max-w-[180px] text-slate-800">{highlightMatch(row.nombre, tableFilter)}</td>
                             <td className="px-6 py-3">
                               <input type="text" value={row.dni} onChange={(e) => {
-                                const originalIdx = extractedData.findIndex(r => r === row);
-                                const updated = [...extractedData];
-                                updated[originalIdx].dni = e.target.value;
-                                updated[originalIdx].method = "MANUAL";
+                                const updated = extractedData.map(r => r.id === row.id ? { ...r, dni: e.target.value, method: "MANUAL" as MatchMethod } : r);
                                 setExtractedData(updated);
-                              }} className={`w-full px-2 py-1 rounded border outline-none transition-all font-mono text-sm ${isValid ? "bg-emerald-50 border-emerald-200 text-emerald-800" : "bg-red-50 border-red-200 text-red-800"}`} />
+                              }} onFocus={() => setEditingRowId(row.id)} onBlur={() => setEditingRowId(null)} className={`w-full px-2 py-1 rounded border outline-none transition-all font-mono text-sm ${isValid ? "bg-emerald-50 border-emerald-200 text-emerald-800" : "bg-red-50 border-red-200 text-red-800"}`} />
                               {/* Resaltado visual en el input del DNI */}
                               {tableFilter && row.dni.toLowerCase().includes(tableFilter.toLowerCase()) && (
                                 <div style={{ position: 'absolute', right: 8, top: 8, pointerEvents: 'none' }}>
@@ -713,7 +875,48 @@ export default function App() {
                               <span className={`inline-flex items-center px-2 py-1 rounded-full text-[10px] font-bold ${isValid ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"}`}>{isValid ? "OK" : "FUERA"}</span>
                             </td>
                             <td className="px-4 py-3 text-center">
-                              <span className={`inline-flex items-center px-2 py-0.5 rounded text-[9px] font-bold border ${row.method === "IA" ? "bg-purple-100 text-purple-700" : row.method === "MANUAL" ? "bg-amber-100 text-amber-700" : "bg-slate-100 text-slate-600"}`}>{row.method}</span>
+                              <div className="flex flex-col items-center gap-1">
+                                <span className={`inline-flex items-center px-2 py-0.5 rounded text-[9px] font-bold border ${
+                                  row.method === "IA"
+                                    ? row.matchConfidence != null && confidenceLevel(row.matchConfidence) === "high"
+                                      ? "bg-emerald-100 text-emerald-700 border-emerald-200"
+                                      : row.matchConfidence != null && confidenceLevel(row.matchConfidence) === "medium"
+                                        ? "bg-amber-100 text-amber-700 border-amber-200"
+                                        : "bg-purple-100 text-purple-700 border-purple-200"
+                                    : row.method === "MANUAL" ? "bg-amber-100 text-amber-700 border-amber-200" : "bg-slate-100 text-slate-600 border-slate-200"
+                                }`}>
+                                  {row.method === "IA" && row.matchConfidence != null
+                                    ? `IA ${Math.round(row.matchConfidence * 100)}%`
+                                    : row.method}
+                                </span>
+                                {!isValid && row.matchCandidates && row.matchCandidates.length > 0 && (
+                                  <div className="relative">
+                                    <button
+                                      onClick={() => setActiveCandidateRow(activeCandidateRow === idx ? null : idx)}
+                                      className="text-[9px] font-bold text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded hover:bg-amber-100 transition-colors"
+                                    >
+                                      💡 {row.matchCandidates.length}
+                                    </button>
+                                    {activeCandidateRow === idx && (
+                                      <div className="absolute right-0 top-full mt-1 z-50 bg-white border border-amber-200 rounded-xl shadow-lg p-2 min-w-[260px]">
+                                        {row.matchCandidates.map((c, ci) => (
+                                          <button key={ci} onClick={() => {
+                                            const updated = extractedData.map(r => r.id === row.id ? { ...r, dni: c.master.dni, method: "IA" as MatchMethod, matchConfidence: c.score } : r);
+                                            setExtractedData(updated);
+                                            setActiveCandidateRow(null);
+                                          }} className="w-full text-left px-3 py-2 hover:bg-amber-50 rounded-lg transition-colors">
+                                            <div className="flex items-center justify-between gap-2">
+                                              <span className="text-xs font-semibold text-slate-800 truncate">{c.master.nombre}</span>
+                                              <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0 ${confidenceLevel(c.score) === "high" ? "bg-emerald-100 text-emerald-700" : confidenceLevel(c.score) === "medium" ? "bg-amber-100 text-amber-700" : "bg-red-100 text-red-700"}`}>{Math.round(c.score * 100)}%</span>
+                                            </div>
+                                            <span className="text-[10px] text-slate-400 font-mono">{c.master.dni}</span>
+                                          </button>
+                                        ))}
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
                             </td>
                             <td className="px-6 py-3 text-[10px] text-slate-400 italic truncate max-w-[100px]">{row.sourceFile}</td>
                             <td className="px-6 py-3 bg-slate-50/30 border-l border-slate-100 text-slate-500 italic">{master ? master.dni : "---"}</td>
@@ -845,21 +1048,127 @@ export default function App() {
       </AnimatePresence>
 
       {/* Floating Search (FAB) */}
-      <div className="fixed bottom-8 right-8 z-50 flex flex-col items-end gap-4">
+      <div className="fixed bottom-8 right-8 z-50 flex flex-col items-end gap-3">
         <AnimatePresence>
           {showSearch && (
-            <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.9 }} className="bg-white border border-slate-200 rounded-2xl shadow-2xl w-80 overflow-hidden"><div className="p-4 bg-slate-50/50"><input autoFocus placeholder="Buscar en Sheets..." value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className="w-full px-4 py-2 border rounded-xl text-sm outline-none focus:border-blue-400" /></div><div className="max-h-60 overflow-y-auto p-2">{searchResults.map((m, i) => (<div key={i} className="p-3 hover:bg-blue-50 rounded-lg cursor-pointer flex flex-col" onClick={() => navigator.clipboard.writeText(m.dni)}><span className="text-xs font-bold text-slate-800 uppercase">{m.nombre}</span><span className="text-[10px] text-blue-600">DNI: {m.dni}</span></div>))}</div></motion.div>
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 10 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 10 }}
+              className="bg-white border border-slate-200 rounded-2xl shadow-2xl overflow-hidden flex flex-col"
+              style={{ width: 360, maxHeight: 520 }}
+            >
+              {/* Header / Input */}
+              <div className="p-3 bg-gradient-to-r from-blue-600 to-indigo-600">
+                <div className="flex items-center gap-2 bg-white/15 border border-white/25 rounded-xl px-3 py-2">
+                  <Search size={14} className="text-white/70 shrink-0" />
+                  <input
+                    autoFocus
+                    placeholder="Buscar por nombre, apellido o DNI..."
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    className="flex-1 bg-transparent text-white text-sm placeholder-white/60 outline-none"
+                  />
+                  {searchQuery && (
+                    <button onClick={() => setSearchQuery("")} className="text-white/60 hover:text-white transition-colors">
+                      <X size={14} />
+                    </button>
+                  )}
+                </div>
+                {searchQuery.trim() && (
+                  <p className="text-white/60 text-[10px] mt-2 px-1">
+                    {searchResults.length} resultado{searchResults.length !== 1 ? "s" : ""} · click para copiar DNI
+                  </p>
+                )}
+              </div>
+
+              {/* Results */}
+              <div className="overflow-y-auto flex-1">
+                {!searchQuery.trim() && (
+                  <div className="flex flex-col items-center justify-center py-10 text-slate-400 gap-2">
+                    <Search size={28} className="opacity-30" />
+                    <p className="text-xs font-medium">Escribe para buscar en la lista maestra</p>
+                    <p className="text-[10px] opacity-70">Nombre, apellido o DNI</p>
+                  </div>
+                )}
+                {searchQuery.trim() && searchResults.length === 0 && (
+                  <div className="flex flex-col items-center justify-center py-10 text-slate-400 gap-2">
+                    <AlertCircle size={24} className="opacity-40" />
+                    <p className="text-xs font-medium">Sin resultados para "{searchQuery}"</p>
+                    <p className="text-[10px] opacity-70">Prueba con otro nombre o parte del DNI</p>
+                  </div>
+                )}
+                {searchResults.map(({ master: m, score, matchType }, i) => (
+                  <button
+                    key={i}
+                    onClick={() => {
+                      navigator.clipboard.writeText(m.dni);
+                      setCopiedDni(m.dni);
+                      setTimeout(() => setCopiedDni(null), 1500);
+                    }}
+                    className="w-full text-left px-4 py-3 hover:bg-blue-50 transition-colors border-b border-slate-50 last:border-0 group/item"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-bold text-slate-800 uppercase leading-snug truncate">
+                          {highlightSearchMatch(m.nombre, searchQuery)}
+                        </p>
+                        <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                          <span className={`font-mono text-[11px] font-bold ${matchType === 'dni_exact' || matchType === 'dni_partial' ? 'text-blue-600' : 'text-slate-500'}`}>
+                            {highlightSearchMatch(m.dni, normalizeDniStrict(searchQuery).length >= 3 ? searchQuery : '')}
+                          </span>
+                          {(matchType === 'dni_exact' || matchType === 'dni_partial') && (
+                            <span className="text-[8px] bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded-full font-bold uppercase tracking-wide">DNI</span>
+                          )}
+                          {matchType === 'fuzzy' && (
+                            <span className="text-[8px] bg-purple-100 text-purple-600 px-1.5 py-0.5 rounded-full font-bold uppercase tracking-wide">~aprox</span>
+                          )}
+                        </div>
+                        {(m.cargo || m.area) && (
+                          <div className="flex gap-1.5 mt-1 flex-wrap">
+                            {m.cargo && <span className="text-[9px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded truncate max-w-[160px]">{m.cargo}</span>}
+                            {m.area && <span className="text-[9px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded truncate max-w-[120px]">{m.area}</span>}
+                          </div>
+                        )}
+                      </div>
+                      <div className="shrink-0 flex flex-col items-end gap-1">
+                        {copiedDni === m.dni ? (
+                          <span className="text-[9px] bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full font-bold">¡Copiado!</span>
+                        ) : (
+                          <span className="text-[9px] text-slate-300 group-hover/item:text-slate-500 transition-colors font-medium opacity-0 group-hover/item:opacity-100">Copiar</span>
+                        )}
+                        <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded-full ${score >= 1.5 ? 'bg-emerald-100 text-emerald-700' : score >= 0.8 ? 'bg-amber-100 text-amber-700' : 'bg-slate-100 text-slate-400'}`}>
+                          {score >= 1.5 ? '●●●' : score >= 0.8 ? '●●○' : '●○○'}
+                        </span>
+                      </div>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </motion.div>
           )}
         </AnimatePresence>
-        <button onClick={() => setShowSearch(!showSearch)} className={`p-4 rounded-full shadow-2xl transition-all ${showSearch ? "bg-slate-800" : "bg-blue-600"} text-white`}>{showSearch ? <X size={24}/> : <SearchCode size={24}/>}</button>
+        <div className="flex items-center gap-3 justify-end">
+          {showSearch && searchQuery.trim() && (
+            <motion.span initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="text-[10px] text-slate-500 bg-white px-2 py-1 rounded-lg shadow border border-slate-200">
+              {searchResults.length} resultado{searchResults.length !== 1 ? "s" : ""}
+            </motion.span>
+          )}
+          <button
+            onClick={() => { setShowSearch(!showSearch); if (showSearch) setSearchQuery(""); }}
+            className={`p-4 rounded-full shadow-2xl transition-all active:scale-95 ${showSearch ? "bg-slate-800 hover:bg-slate-700" : "bg-blue-600 hover:bg-blue-700"} text-white`}
+          >
+            {showSearch ? <X size={24}/> : <SearchCode size={24}/>}
+          </button>
+        </div>
       </div>
     </div>
   );
 }
 
-function HeaderCell({ label, colKey, sortConfig, onSort, onFilter, isFiltered, center }: any) {
+function HeaderCell({ label, colKey, sortConfig, onSort, onFilter, isFiltered, center, width, onResizeStart }: any) {
   return (
-    <th className={`px-6 py-4 border-b border-slate-200 relative group ${center ? "text-center" : ""}`}>
+    <th className={`px-6 py-4 border-b border-slate-200 relative group group/th ${center ? "text-center" : ""}`} style={{ width, minWidth: 50 }}>
       <div className={`flex items-center gap-1.5 ${center ? "justify-center" : ""}`}>
         <span className="cursor-pointer select-none" onClick={() => onSort(colKey)}>{label}</span>
         <div className="flex flex-col opacity-0 group-hover:opacity-100 transition-opacity">
@@ -867,6 +1176,10 @@ function HeaderCell({ label, colKey, sortConfig, onSort, onFilter, isFiltered, c
         </div>
         <button onClick={(e) => { e.stopPropagation(); onFilter(); }} className={`p-1 rounded hover:bg-slate-100 transition-colors ${isFiltered ? "text-blue-600" : "text-slate-300"}`}><Filter size={10} fill={isFiltered ? "currentColor" : "none"} /></button>
       </div>
+      <div
+        className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-blue-400 opacity-0 group-hover/th:opacity-100 transition-opacity z-10"
+        onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); onResizeStart(colKey, e.clientX, width); }}
+      />
     </th>
   );
 }
