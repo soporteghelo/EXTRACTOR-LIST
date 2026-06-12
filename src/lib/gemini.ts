@@ -26,7 +26,7 @@ export async function processDocuments(files: { data: string; mimeType: string; 
   });
 
   parts.push({
-    text: "Extrae la información de las tablas en estos documentos siguiendo estrictamente el formato CSV requerido. Es CRITICO que en la columna 'SourceFile' coloques exactamente el nombre del archivo (ej. A1.jpeg) de donde proviene cada fila.",
+    text: "Extrae la información de las tablas en estos documentos siguiendo estrictamente el formato CSV requerido. Es CRITICO que en la columna 'SourceFile' coloques exactamente el nombre del archivo (ej. A1.jpeg) de donde proviene cada fila, en 'FilaDoc' el número de renglón físico (de arriba hacia abajo, empezando en 1, sin contar la cabecera), en 'Pagina' el número de página (empezando en 1), en 'RowAnchors' los 4 enteros 'yCentroPrimera,xIzquierda,yCentroUltima,xDerecha' (0-1000): el centro vertical del PRIMER y del ÚLTIMO renglón de datos y los bordes izquierdo/derecho de la tabla (idéntico para toda la página), y en 'TotalFilas' el número del último renglón físico (idéntico para toda la página). Apunta los centros con precisión: de ellos depende que la marca caiga exactamente sobre la fila correcta.",
   });
 
   let lastError: any;
@@ -53,7 +53,7 @@ export async function processDocuments(files: { data: string; mimeType: string; 
       text = text.trim();
 
       if (!text.toLowerCase().includes("sourcefile")) {
-         text = "Nro;Apellidos y Nombres;DNI;Ocupacion;Area;SourceFile\n" + text;
+         text = "Nro;Apellidos y Nombres;DNI;Ocupacion;Area;SourceFile;FilaDoc;Pagina;RowAnchors;TotalFilas\n" + text;
       }
 
       console.log(`¡Éxito con el modelo ${modelName}!`);

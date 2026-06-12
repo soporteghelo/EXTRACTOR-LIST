@@ -36,6 +36,8 @@ import {
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { processDocuments } from "./lib/gemini";
+import { renderPdfToImages } from "./lib/pdf";
+import { detectDataRowBands } from "./lib/rowDetect";
 import { APP_NAME, APP_SUBTITLE, MASTER_DATA_URL } from "./config";
 import { normalizeDniStrict, nameMatchScore, dniFuzzyScore, confidenceLevel, normalizeText } from "./lib/matching";
 
@@ -46,6 +48,14 @@ interface DocumentFile {
   mimeType: string;
   previewUrl: string | null;
   base64: string;
+  pages: string[]; // imágenes (data URL) por página; imagen = 1 página
+}
+
+interface BBox {
+  ymin: number;
+  xmin: number;
+  ymax: number;
+  xmax: number;
 }
 
 type MatchMethod = "DEFAULT" | "MANUAL" | "IA";
@@ -58,6 +68,10 @@ interface ExtractedRow {
   ocupacion: string;
   area: string;
   sourceFile: string;
+  filaDoc: string;
+  pagina: string;
+  bbox: BBox | null;
+  rowTotal: number; // total de renglones de su página (para detección de grid)
   method: MatchMethod;
   matchConfidence?: number;
   matchCandidates?: { master: MasterRow; score: number }[];
@@ -86,6 +100,63 @@ function parseCSVRow(row: string) {
   }
   result.push(current.trim());
   return result;
+}
+
+// Parsea "ymin,xmin,ymax,xmax" (0-1000) a un BBox; devuelve null si es inválido.
+function parseBBox(raw: string): BBox | null {
+  if (!raw) return null;
+  const nums = raw.replace(/[\[\]()]/g, "").split(",").map((n) => parseInt(n.trim(), 10));
+  if (nums.length < 4 || nums.some((n) => isNaN(n))) return null;
+  let [ymin, xmin, ymax, xmax] = nums;
+  // Asegura orden correcto
+  if (ymax < ymin) [ymin, ymax] = [ymax, ymin];
+  if (xmax < xmin) [xmin, xmax] = [xmax, xmin];
+  const clamp = (v: number) => Math.max(0, Math.min(1000, v));
+  return { ymin: clamp(ymin), xmin: clamp(xmin), ymax: clamp(ymax), xmax: clamp(xmax) };
+}
+
+// Busca y puntúa coincidencias en la lista maestra por DNI o nombre.
+function scoreMasterSearch(query: string, masterData: MasterRow[]): { master: MasterRow; score: number; matchType: string }[] {
+  const q = query.trim();
+  if (!q) return [];
+
+  const qNorm = normalizeText(q);
+  const qNormDni = normalizeDniStrict(q);
+  const qTokens = qNorm.split(/\s+/).filter((t: string) => t.length >= 2);
+
+  const scored: { master: MasterRow; score: number; matchType: string }[] = [];
+
+  for (const m of masterData) {
+    const nameNorm = normalizeText(m.nombre);
+    const dniNorm = normalizeDniStrict(m.dni);
+    const nameWords = nameNorm.split(/\s+/);
+
+    // --- DNI matches (highest priority) ---
+    // Busca desde 2 dígitos: exacto > prefijo > contiene.
+    if (qNormDni.length >= 2) {
+      if (dniNorm === qNormDni) { scored.push({ master: m, score: 2.0, matchType: 'dni_exact' }); continue; }
+      if (dniNorm.startsWith(qNormDni)) { scored.push({ master: m, score: 1.85 - (8 - qNormDni.length) * 0.04, matchType: 'dni_partial' }); continue; }
+      if (qNormDni.length >= 3 && dniNorm.includes(qNormDni)) { scored.push({ master: m, score: 1.3, matchType: 'dni_partial' }); continue; }
+    }
+
+    // --- Name matches ---
+    if (qTokens.length > 0) {
+      const allWordStart = qTokens.every((t: string) => nameWords.some((w: string) => w.startsWith(t)));
+      if (allWordStart) { scored.push({ master: m, score: 1.1 + (qTokens.length > 1 ? 0.15 : 0), matchType: 'name' }); continue; }
+      const allContain = qTokens.every((t: string) => nameNorm.includes(t));
+      if (allContain) { scored.push({ master: m, score: 0.85 + (qTokens.length > 1 ? 0.10 : 0), matchType: 'name' }); continue; }
+      if (qTokens.some((t: string) => t.length >= 3 && nameWords.some((w: string) => w.startsWith(t)))) { scored.push({ master: m, score: 0.60, matchType: 'name' }); continue; }
+      if (qTokens.some((t: string) => t.length >= 3 && nameNorm.includes(t))) { scored.push({ master: m, score: 0.40, matchType: 'name' }); continue; }
+    }
+
+    // Fuzzy fallback for longer queries
+    if (qNorm.length >= 5) {
+      const fuzzy = nameMatchScore(q, m.nombre);
+      if (fuzzy >= 0.62) scored.push({ master: m, score: fuzzy * 0.50, matchType: 'fuzzy' });
+    }
+  }
+
+  return scored.sort((a, b) => b.score - a.score).slice(0, 15);
 }
 
 export default function App() {
@@ -157,14 +228,17 @@ export default function App() {
   
   const [showSearch, setShowSearch] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
+  const [viewerQuery, setViewerQuery] = useState("");
   const [copiedDni, setCopiedDni] = useState<string | null>(null);
   
   // Viewer state
-  const [viewingImage, setViewingImage] = useState<{ url: string, name: string } | null>(null);
+  const [viewingImage, setViewingImage] = useState<{ url: string, name: string, bbox: BBox | null, fila: string, pagina: string, totalPages: number, rowId: string | null } | null>(null);
   const [zoomLevel, setZoomLevel] = useState(1);
   const [panOffset, setPanOffset] = useState({ x: 0, y: 0 });
   const [isPanning, setIsPanning] = useState(false);
   const panStartRef = useRef({ x: 0, y: 0 });
+  const [bboxNudge, setBboxNudge] = useState(0); // corrección manual ±filas para la marca
+  const [viewerDropdownOpen, setViewerDropdownOpen] = useState(false); // navegador de registros FUERA en el visor
 
   const [tableFilter, setTableFilter] = useState("");
   const [sortConfig, setSortConfig] = useState<{ key: string, direction: 'asc' | 'desc' } | null>(null);
@@ -177,7 +251,7 @@ export default function App() {
   const [activeCandidateRow, setActiveCandidateRow] = useState<number | null>(null);
   const [editingRowId, setEditingRowId] = useState<string | null>(null);
   const [colWidths, setColWidths] = useState<Record<string, number>>({
-    nro: 60, ver: 60, nombre: 200, dni: 130, estado: 80, method: 110, sourceFile: 130, dniSheets: 130, nombreOficial: 220
+    nro: 60, ver: 60, nombre: 200, dni: 130, estado: 80, method: 110, sourceFile: 130, filaDoc: 90, dniSheets: 130, nombreOficial: 220
   });
   const resizingRef = useRef<{ col: string; startX: number; startWidth: number } | null>(null);
 
@@ -242,15 +316,30 @@ export default function App() {
           reader.onerror = reject;
           reader.readAsDataURL(f);
         });
-        const previewUrl = f.type.startsWith("image/") ? await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve(reader.result as string);
-          reader.onerror = reject;
-          reader.readAsDataURL(f);
-        }) : null;
+        let pages: string[] = [];
+        let previewUrl: string | null = null;
+
+        if (f.type.startsWith("image/")) {
+          const dataUrl = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = reject;
+            reader.readAsDataURL(f);
+          });
+          pages = [dataUrl];
+          previewUrl = dataUrl;
+        } else if (f.type === "application/pdf") {
+          try {
+            pages = await renderPdfToImages(base64Data);
+            previewUrl = pages[0] || null;
+          } catch (err) {
+            console.error("No se pudo renderizar el PDF:", f.name, err);
+          }
+        }
+
         newProcessedFiles.push({
           id: Math.random().toString(36).substring(7),
-          name: f.name, size: f.size, mimeType: f.type, base64: base64Data, previewUrl: previewUrl
+          name: f.name, size: f.size, mimeType: f.type, base64: base64Data, previewUrl, pages
         });
       } catch (err) { console.error("Error processing file:", f.name, err); }
     }
@@ -270,15 +359,81 @@ export default function App() {
       const inputFormats = files.map((f) => ({ data: f.base64, mimeType: f.mimeType, name: f.name }));
       const result = await processDocuments(inputFormats);
       const rows = result.csv.split('\n').slice(1);
-      const parsed: ExtractedRow[] = rows.map((row: string, rowIndex: number) => {
+
+      // Paso 1: parseo crudo (guardando la geometría de tabla y total de filas reportados).
+      type RawRow = ExtractedRow & { _tableBox: BBox | null; _totalFilas: number };
+      const rawRows: RawRow[] = rows.map((row: string, rowIndex: number) => {
         const cols = row.split(';');
         return {
           id: `r${rowIndex}_${Date.now()}`,
           nro: cols[0] || "", nombre: cols[1] || "", dni: cols[2] || "",
           ocupacion: cols[3] || "", area: cols[4] || "", sourceFile: cols[5]?.trim() || "",
-          method: "DEFAULT" as MatchMethod
+          filaDoc: cols[6]?.trim() || "",
+          pagina: cols[7]?.trim() || "1",
+          bbox: null,
+          rowTotal: 0,
+          method: "DEFAULT" as MatchMethod,
+          _tableBox: parseBBox(cols[8]?.trim() || ""),
+          _totalFilas: parseInt(cols[9]?.trim() || "", 10),
         };
-      }).filter((r: ExtractedRow) => r.nombre || r.dni);
+      }).filter((r: RawRow) => r.nombre || r.dni);
+
+      // Paso 2: consenso de geometría por (archivo + página) para anular el ruido de la IA.
+      const median = (arr: number[]) => {
+        if (arr.length === 0) return NaN;
+        const s = [...arr].sort((a, b) => a - b);
+        const mid = Math.floor(s.length / 2);
+        return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+      };
+      const groups: Record<string, RawRow[]> = {};
+      rawRows.forEach((r) => {
+        const key = `${r.sourceFile.toLowerCase()}||${r.pagina}`;
+        (groups[key] ||= []).push(r);
+      });
+      const consensus: Record<string, { box: BBox | null; total: number }> = {};
+      Object.keys(groups).forEach((key) => {
+        const arr = groups[key];
+        const boxes = arr.map((a) => a._tableBox).filter((b): b is BBox => !!b);
+        const totals = arr.map((a) => a._totalFilas).filter((n) => !isNaN(n) && n > 0);
+        // El total no puede ser menor que la fila física más alta detectada.
+        const maxFila = Math.max(0, ...arr.map((a) => parseInt(a.filaDoc, 10)).filter((n) => !isNaN(n)));
+        const box: BBox | null = boxes.length
+          ? {
+              ymin: Math.round(median(boxes.map((b) => b.ymin))),
+              xmin: Math.round(median(boxes.map((b) => b.xmin))),
+              ymax: Math.round(median(boxes.map((b) => b.ymax))),
+              xmax: Math.round(median(boxes.map((b) => b.xmax))),
+            }
+          : null;
+        const total = Math.max(Math.round(median(totals)) || 0, maxFila);
+        consensus[key] = { box, total };
+      });
+
+      // Paso 3: interpolación por CENTROS. box.ymin = centro del primer renglón,
+      // box.ymax = centro del último renglón (renglón nº total). Cada fila se ubica
+      // proporcionalmente entre ambos centros según su número FilaDoc.
+      const clampN = (v: number) => Math.max(0, Math.min(1000, v));
+      const parsed: ExtractedRow[] = rawRows.map((r) => {
+        const key = `${r.sourceFile.toLowerCase()}||${r.pagina}`;
+        const c = consensus[key];
+        const fila = parseInt(r.filaDoc, 10);
+        let bbox: BBox | null = null;
+        if (c && c.box && c.total >= 1 && !isNaN(fila) && fila >= 1) {
+          const y1 = c.box.ymin; // centro del primer renglón
+          const yN = c.box.ymax; // centro del último renglón
+          const N = c.total;
+          const rowH = N > 1 ? (yN - y1) / (N - 1) : Math.max(yN - y1, 25);
+          const center = y1 + (fila - 1) * rowH;
+          bbox = {
+            xmin: c.box.xmin,
+            xmax: c.box.xmax,
+            ymin: clampN(Math.round(center - rowH / 2)),
+            ymax: clampN(Math.round(center + rowH / 2)),
+          };
+        }
+        const { _tableBox, _totalFilas, ...clean } = r;
+        return { ...clean, bbox, rowTotal: c?.total || 0 };
+      });
       setExtractedData(parsed);
       setModelUsed(result.modelUsed);
       setStatus("success");
@@ -358,22 +513,80 @@ export default function App() {
   };
 
   const getCsvString = () => {
-    const header = "DNI;NOMBRE OFICIAL;OCUPACION;AREA;METODO;ORIGEN";
+    const header = "DNI;NOMBRE OFICIAL;OCUPACION;AREA;METODO;ORIGEN;FILA DOC";
     const bodyRows = displayedData.map((row: ExtractedRow) => {
       const master = getMasterInfo(row.dni);
       if (!master) return null;
-      return `${row.dni.toUpperCase()};${master.nombre.toUpperCase()};${master.cargo.toUpperCase()};${master.area.toUpperCase()};${row.method};${row.sourceFile}`;
+      return `${row.dni.toUpperCase()};${master.nombre.toUpperCase()};${master.cargo.toUpperCase()};${master.area.toUpperCase()};${row.method};${row.sourceFile};${row.filaDoc}`;
     }).filter((r: string | null) => r !== null);
     return [header, ...bodyRows].join('\n');
   };
 
-  const handleViewSource = (filename: string) => {
-    if (!filename) return;
-    const file = files.find((f: DocumentFile) => f.name.toLowerCase().includes(filename.toLowerCase().split('.')[0]));
-    if (file?.previewUrl) {
-      setViewingImage({ url: file.previewUrl, name: file.name });
-      setZoomLevel(1); setPanOffset({ x: 0, y: 0 });
+  const findSourceFile = (filename: string): DocumentFile | undefined => {
+    if (!filename) return undefined;
+    const base = filename.toLowerCase().split('.')[0];
+    return files.find((f: DocumentFile) => f.name.toLowerCase().includes(base)) || files.find((f: DocumentFile) => f.name.toLowerCase() === filename.toLowerCase());
+  };
+
+  const openViewer = (filename: string, pagina: string, bbox: BBox | null, fila: string, rowId: string | null) => {
+    const file = findSourceFile(filename);
+    if (!file || !file.pages || file.pages.length === 0) {
+      if (file && file.previewUrl) {
+        setViewingImage({ url: file.previewUrl, name: file.name, bbox: null, fila: "", pagina: "1", totalPages: 1, rowId });
+        setZoomLevel(1); setPanOffset({ x: 0, y: 0 }); setBboxNudge(0);
+      }
+      return;
     }
+    const pageIdx = Math.max(0, (parseInt(pagina || "1", 10) || 1) - 1);
+    const safeIdx = Math.min(pageIdx, file.pages.length - 1);
+    setViewingImage({ url: file.pages[safeIdx], name: file.name, bbox, fila, pagina: String(safeIdx + 1), totalPages: file.pages.length, rowId });
+    setZoomLevel(1); setPanOffset({ x: 0, y: 0 }); setBboxNudge(0);
+  };
+
+  // Abre el documento marcando la fila exacta del registro, con panel de edición.
+  // Primero muestra la marca aproximada (IA) y luego la refina detectando el grid real.
+  const handleViewRow = async (row: ExtractedRow) => {
+    setViewerQuery(row.nombre || row.dni || "");
+    openViewer(row.sourceFile, row.pagina, row.bbox, row.filaDoc, row.id);
+
+    const fila = parseInt(row.filaDoc, 10);
+    if (isNaN(fila) || fila < 1) return;
+    const file = findSourceFile(row.sourceFile);
+    if (!file || !file.pages?.length) return;
+    const pageIdx = Math.min(Math.max(0, (parseInt(row.pagina || "1", 10) || 1) - 1), file.pages.length - 1);
+
+    const xMin = row.bbox ? row.bbox.xmin / 1000 : 0.03;
+    const xMax = row.bbox ? row.bbox.xmax / 1000 : 0.97;
+    const bands = await detectDataRowBands(file.pages[pageIdx], xMin, xMax, row.rowTotal);
+    if (!bands || !bands.length) return;
+
+    // Alineado desde abajo: si el grid detectado incluye la fila de títulos al inicio,
+    // se descarta. Las N filas de datos se anclan al final del grid.
+    const N = row.rowTotal;
+    let idx = (N >= 2 && bands.length >= N) ? bands.length - N + (fila - 1) : fila - 1;
+    idx = Math.min(Math.max(0, idx), bands.length - 1);
+    const band = bands[idx];
+    if (!band) return;
+
+    setViewingImage((prev) =>
+      prev && prev.rowId === row.id
+        ? {
+            ...prev,
+            bbox: {
+              xmin: row.bbox?.xmin ?? Math.round(xMin * 1000),
+              xmax: row.bbox?.xmax ?? Math.round(xMax * 1000),
+              ymin: Math.round(band.top * 1000),
+              ymax: Math.round(band.bottom * 1000),
+            },
+          }
+        : prev
+    );
+  };
+
+  // Apertura simple (doble clic en el archivo de la barra lateral): primera página, sin marca.
+  const handleViewSource = (filename: string) => {
+    setViewerQuery("");
+    openViewer(filename, "1", null, "", null);
   };
 
   // Advanced Viewer Handlers
@@ -496,74 +709,19 @@ export default function App() {
     return Array.from(new Set(values)).filter((v): v is string => !!v).sort();
   };
 
-  const searchResults = useMemo((): { master: MasterRow; score: number; matchType: string }[] => {
-    const q = searchQuery.trim();
-    if (!q) return [];
+  const searchResults = useMemo(() => scoreMasterSearch(searchQuery, masterData), [searchQuery, masterData]);
+  const viewerResults = useMemo(() => scoreMasterSearch(viewerQuery, masterData), [viewerQuery, masterData]);
 
-    const qNorm = normalizeText(q);
-    const qNormDni = normalizeDniStrict(q);
-    const qTokens = qNorm.split(/\s+/).filter((t: string) => t.length >= 2);
+  // Registro actualmente inspeccionado en el visor (para edición en vivo).
+  const viewingRow = useMemo(
+    () => (viewingImage?.rowId ? extractedData.find((r) => r.id === viewingImage.rowId) || null : null),
+    [viewingImage, extractedData]
+  );
+  const viewingRowMaster = viewingRow ? getMasterInfo(viewingRow.dni) : undefined;
 
-    const scored: { master: MasterRow; score: number; matchType: string }[] = [];
-
-    for (const m of masterData) {
-      const nameNorm = normalizeText(m.nombre);
-      const dniNorm = normalizeDniStrict(m.dni);
-      const nameWords = nameNorm.split(/\s+/);
-
-      // --- DNI matches (highest priority) ---
-      if (qNormDni.length >= 3) {
-        if (dniNorm === qNormDni) {
-          scored.push({ master: m, score: 2.0, matchType: 'dni_exact' });
-          continue;
-        }
-        if (dniNorm.startsWith(qNormDni)) {
-          scored.push({ master: m, score: 1.8 - (8 - qNormDni.length) * 0.05, matchType: 'dni_partial' });
-          continue;
-        }
-        if (qNormDni.length >= 4 && dniNorm.includes(qNormDni)) {
-          scored.push({ master: m, score: 1.3, matchType: 'dni_partial' });
-          continue;
-        }
-      }
-
-      // --- Name matches ---
-      if (qTokens.length > 0) {
-        // All tokens match word-start (best name result)
-        const allWordStart = qTokens.every((t: string) => nameWords.some((w: string) => w.startsWith(t)));
-        if (allWordStart) {
-          scored.push({ master: m, score: 1.1 + (qTokens.length > 1 ? 0.15 : 0), matchType: 'name' });
-          continue;
-        }
-        // All tokens present anywhere (order-agnostic contains)
-        const allContain = qTokens.every((t: string) => nameNorm.includes(t));
-        if (allContain) {
-          scored.push({ master: m, score: 0.85 + (qTokens.length > 1 ? 0.10 : 0), matchType: 'name' });
-          continue;
-        }
-        // At least one token matches word-start (partial multi-word)
-        if (qTokens.some((t: string) => t.length >= 3 && nameWords.some((w: string) => w.startsWith(t)))) {
-          scored.push({ master: m, score: 0.60, matchType: 'name' });
-          continue;
-        }
-        // At least one token is contained
-        if (qTokens.some((t: string) => t.length >= 3 && nameNorm.includes(t))) {
-          scored.push({ master: m, score: 0.40, matchType: 'name' });
-          continue;
-        }
-      }
-
-      // Fuzzy fallback for longer queries
-      if (qNorm.length >= 5) {
-        const fuzzy = nameMatchScore(q, m.nombre);
-        if (fuzzy >= 0.62) {
-          scored.push({ master: m, score: fuzzy * 0.50, matchType: 'fuzzy' });
-        }
-      }
-    }
-
-    return scored.sort((a, b) => b.score - a.score).slice(0, 15);
-  }, [searchQuery, masterData]);
+  const applyDniToRow = (rowId: string, dni: string, method: MatchMethod = "MANUAL", confidence?: number) => {
+    setExtractedData((prev) => prev.map((r) => (r.id === rowId ? { ...r, dni, method, matchConfidence: confidence } : r)));
+  };
 
   return (
     <div className="flex h-screen w-full bg-slate-50 text-slate-800 font-sans overflow-hidden relative">
@@ -753,7 +911,7 @@ export default function App() {
                           <span className="text-xs font-bold text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full">#{row.nro}</span>
                           <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${isValid ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"}`}>{isValid ? "VÁLIDO" : "SIN MATCH"}</span>
                         </div>
-                        <button onClick={() => handleViewSource(row.sourceFile)} className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-50 text-blue-600 hover:bg-blue-100 rounded-lg transition-colors text-xs font-bold"><Eye size={14} /> Ver Doc</button>
+                        <button onClick={() => handleViewRow(row)} className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-50 text-blue-600 hover:bg-blue-100 rounded-lg transition-colors text-xs font-bold"><Eye size={14} /> Ver Doc</button>
                       </div>
                       
                       <div className="pl-2 flex flex-col gap-2">
@@ -810,7 +968,14 @@ export default function App() {
                         )}
 
                         <div className="flex items-center justify-between mt-1">
-                          <span className="text-[9px] text-slate-400 italic truncate max-w-[150px]">{row.sourceFile}</span>
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            {row.filaDoc && (
+                              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-bold bg-indigo-100 text-indigo-700 border border-indigo-200 shrink-0">
+                                <FileDigit size={10} /> Fila {row.filaDoc}
+                              </span>
+                            )}
+                            <span className="text-[9px] text-slate-400 italic truncate max-w-[120px]">{row.sourceFile}</span>
+                          </div>
                           <span className={`px-2 py-0.5 rounded text-[9px] font-bold border ${
                             row.method === "IA"
                               ? row.matchConfidence != null && confidenceLevel(row.matchConfidence) === "high"
@@ -844,6 +1009,7 @@ export default function App() {
                         <HeaderCell label="Estado" colKey="estado" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("estado")} isFiltered={(activeFilters["estado"]?.length || 0) > 0} center width={colWidths.estado} onResizeStart={handleResizeStart} />
                         <HeaderCell label="Método" colKey="method" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("method")} isFiltered={(activeFilters["method"]?.length || 0) > 0} center width={colWidths.method} onResizeStart={handleResizeStart} />
                         <HeaderCell label="Origen" colKey="sourceFile" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("sourceFile")} isFiltered={(activeFilters["sourceFile"]?.length || 0) > 0} width={colWidths.sourceFile} onResizeStart={handleResizeStart} />
+                        <HeaderCell label="Fila Doc" colKey="filaDoc" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("filaDoc")} isFiltered={(activeFilters["filaDoc"]?.length || 0) > 0} center width={colWidths.filaDoc} onResizeStart={handleResizeStart} />
                         <th className="px-6 py-4 border-b border-slate-200 border-l border-slate-200 text-blue-600 relative group/th" style={{ width: colWidths.dniSheets, minWidth: 50 }}>DNI Sheets<div className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-blue-400 opacity-0 group-hover/th:opacity-100 transition-opacity z-10" onMouseDown={(e) => { e.preventDefault(); handleResizeStart('dniSheets', e.clientX, colWidths.dniSheets); }} /></th>
                         <th className="px-6 py-4 border-b border-slate-200 text-blue-600 relative group/th" style={{ width: colWidths.nombreOficial, minWidth: 50 }}>Nombre Oficial<div className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-blue-400 opacity-0 group-hover/th:opacity-100 transition-opacity z-10" onMouseDown={(e) => { e.preventDefault(); handleResizeStart('nombreOficial', e.clientX, colWidths.nombreOficial); }} /></th>
                       </tr>
@@ -856,7 +1022,7 @@ export default function App() {
                           <tr key={row.id} className="hover:bg-slate-50/50 transition-colors group/row">
                             <td className="px-4 py-3 text-slate-400">{row.nro}</td>
                             <td className="px-4 py-3 text-center">
-                              <button onClick={() => handleViewSource(row.sourceFile)} className="p-1.5 text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"><Eye size={16} /></button>
+                              <button onClick={() => handleViewRow(row)} className="p-1.5 text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"><Eye size={16} /></button>
                             </td>
                             <td className="px-6 py-3 truncate max-w-[180px] text-slate-800">{highlightMatch(row.nombre, tableFilter)}</td>
                             <td className="px-6 py-3">
@@ -919,6 +1085,19 @@ export default function App() {
                               </div>
                             </td>
                             <td className="px-6 py-3 text-[10px] text-slate-400 italic truncate max-w-[100px]">{row.sourceFile}</td>
+                            <td className="px-4 py-3 text-center">
+                              {row.filaDoc ? (
+                                <button
+                                  onClick={() => handleViewRow(row)}
+                                  title={`Identificado en la fila ${row.filaDoc} de ${row.sourceFile || "el documento"}`}
+                                  className="inline-flex items-center gap-1 px-2 py-1 rounded-full text-[10px] font-bold bg-indigo-100 text-indigo-700 border border-indigo-200 hover:bg-indigo-200 transition-colors"
+                                >
+                                  <FileDigit size={11} /> Fila {row.filaDoc}
+                                </button>
+                              ) : (
+                                <span className="text-slate-300 text-xs">—</span>
+                              )}
+                            </td>
                             <td className="px-6 py-3 bg-slate-50/30 border-l border-slate-100 text-slate-500 italic">{master ? master.dni : "---"}</td>
                             <td className="px-6 py-3 bg-slate-50/30 text-slate-600">{master ? master.nombre : "---"}</td>
                           </tr>
@@ -992,10 +1171,22 @@ export default function App() {
                 <div className="hidden md:flex p-2.5 bg-blue-600 text-white rounded-xl shadow-lg"><ImageIcon size={20} /></div>
                 <div className="flex-1 min-w-0">
                   <h3 className="text-white font-semibold text-xs md:text-sm leading-tight truncate max-w-[150px] md:max-w-md">{viewingImage.name}</h3>
-                  <p className="text-slate-300 text-[9px] md:text-[10px] uppercase tracking-widest font-bold">Modo Inspección</p>
+                  <p className="text-slate-300 text-[9px] md:text-[10px] uppercase tracking-widest font-bold flex items-center gap-2 flex-wrap">
+                    <span>Modo Inspección</span>
+                    {viewingImage.totalPages > 1 && <span className="text-blue-300 normal-case tracking-normal">Pág {viewingImage.pagina}/{viewingImage.totalPages}</span>}
+                    {viewingImage.fila && <span className="text-red-300 normal-case tracking-normal">Fila {viewingImage.fila}</span>}
+                    {viewingImage.fila && !viewingImage.bbox && <span className="text-amber-300 normal-case tracking-normal">(sin ubicación exacta)</span>}
+                  </p>
                 </div>
               </div>
               <div className="flex items-center gap-2 pointer-events-auto ml-auto">
+                {viewingImage.bbox && (
+                  <div className="flex items-center bg-white/10 backdrop-blur-xl rounded-xl md:rounded-2xl border border-white/20 p-1 mr-1 md:mr-2 shadow-2xl" title="Ajustar la marca una fila arriba/abajo si está desfasada">
+                    <button onClick={() => setBboxNudge(n => n - 1)} className="p-1.5 md:p-2.5 text-white/80 hover:text-white hover:bg-white/10 rounded-lg md:rounded-xl transition-all"><ArrowUp size={16} className="md:w-5 md:h-5"/></button>
+                    <span className="px-1 text-[9px] md:text-[10px] font-mono font-bold text-red-300 uppercase tracking-wide select-none">Fila</span>
+                    <button onClick={() => setBboxNudge(n => n + 1)} className="p-1.5 md:p-2.5 text-white/80 hover:text-white hover:bg-white/10 rounded-lg md:rounded-xl transition-all"><ArrowDown size={16} className="md:w-5 md:h-5"/></button>
+                  </div>
+                )}
                 <div className="flex items-center bg-white/10 backdrop-blur-xl rounded-xl md:rounded-2xl border border-white/20 p-1 mr-1 md:mr-2 shadow-2xl">
                   <button onClick={() => setZoomLevel(p => Math.max(0.5, p/1.2))} className="p-1.5 md:p-2.5 text-white/80 hover:text-white hover:bg-white/10 rounded-lg md:rounded-xl transition-all"><ZoomOut size={16} className="md:w-5 md:h-5"/></button>
                   <div className="px-2 md:px-4 min-w-[50px] md:min-w-[70px] text-center"><span className="text-xs md:text-sm font-mono font-black text-blue-400">{(zoomLevel*100).toFixed(0)}%</span></div>
@@ -1007,8 +1198,8 @@ export default function App() {
             </div>
 
             {/* Interaction Canvas */}
-            <div 
-              className={`relative w-full h-full flex items-center justify-center overflow-hidden cursor-${isPanning ? 'grabbing' : 'grab'} touch-none`}
+            <div
+              className={`relative w-full h-full flex items-center justify-center overflow-hidden cursor-${isPanning ? 'grabbing' : 'grab'} touch-none transition-all ${viewingRow ? 'pb-[46vh] md:pb-0 md:pr-[396px]' : ''}`}
               onMouseDown={handlePanStart}
               onMouseMove={handlePanMove}
               onMouseUp={handlePanEnd}
@@ -1017,32 +1208,197 @@ export default function App() {
               onTouchMove={handleTouchMove}
               onTouchEnd={handleTouchEnd}
             >
-              <motion.img 
-                src={viewingImage.url} 
-                draggable={false}
-                animate={{ 
-                  scale: zoomLevel,
-                  x: panOffset.x,
-                  y: panOffset.y
-                }}
-                transition={{ 
-                  type: "spring",
-                  stiffness: 300,
-                  damping: 30,
-                  mass: 0.5
-                }}
-                className="max-w-[90%] max-h-[90%] object-contain shadow-[0_0_100px_rgba(0,0,0,0.5)] rounded-sm pointer-events-none"
-              />
+              <motion.div
+                animate={{ scale: zoomLevel, x: panOffset.x, y: panOffset.y }}
+                transition={{ type: "spring", stiffness: 300, damping: 30, mass: 0.5 }}
+                className="relative pointer-events-none"
+                style={{ width: "fit-content", height: "fit-content", lineHeight: 0 }}
+              >
+                <img
+                  src={viewingImage.url}
+                  draggable={false}
+                  className="max-w-[88vw] max-h-[85vh] object-contain shadow-[0_0_100px_rgba(0,0,0,0.5)] rounded-sm block"
+                />
+                {viewingImage.bbox && (() => {
+                  const rowH = viewingImage.bbox.ymax - viewingImage.bbox.ymin;
+                  const shift = bboxNudge * rowH;
+                  const top = Math.max(0, viewingImage.bbox.ymin + shift);
+                  return (
+                  <motion.div
+                    className="absolute border-2 border-red-500 rounded-[2px] bg-red-500/10"
+                    style={{
+                      left: `${viewingImage.bbox.xmin / 10}%`,
+                      top: `${top / 10}%`,
+                      width: `${(viewingImage.bbox.xmax - viewingImage.bbox.xmin) / 10}%`,
+                      height: `${rowH / 10}%`,
+                      boxShadow: "0 0 0 9999px rgba(2,6,23,0.55)",
+                    }}
+                    initial={{ opacity: 0.5 }}
+                    animate={{ opacity: [0.5, 1, 0.5] }}
+                    transition={{ repeat: Infinity, duration: 1.6, ease: "easeInOut" }}
+                  >
+                    {viewingImage.fila && (
+                      <span
+                        className="absolute left-0 bg-red-500 text-white text-[7px] font-bold px-1.5 py-0.5 rounded whitespace-nowrap shadow-lg"
+                        style={{ bottom: "100%", marginBottom: 2, transform: `scale(${1 / Math.max(zoomLevel, 0.6)})`, transformOrigin: "bottom left" }}
+                      >
+                        Fila {viewingImage.fila}{viewingImage.totalPages > 1 ? ` · Pág ${viewingImage.pagina}` : ""}{bboxNudge !== 0 ? ` (${bboxNudge > 0 ? "+" : ""}${bboxNudge})` : ""}
+                      </span>
+                    )}
+                  </motion.div>
+                  );
+                })()}
+              </motion.div>
             </div>
 
+            {/* Panel de edición del registro actual */}
+            {viewingRow && (
+              <motion.div
+                initial={{ opacity: 0, y: 30 }}
+                animate={{ opacity: 1, y: 0 }}
+                onWheel={(e) => e.stopPropagation()}
+                onMouseDown={(e) => e.stopPropagation()}
+                className="absolute z-40 pointer-events-auto bg-slate-900/92 backdrop-blur-2xl text-white shadow-2xl flex flex-col
+                  inset-x-0 bottom-0 max-h-[46vh] rounded-t-3xl border-t border-white/10
+                  md:inset-y-0 md:left-auto md:right-0 md:bottom-auto md:w-[384px] md:max-h-none md:rounded-none md:border-t-0 md:border-l md:pt-20"
+              >
+                <div className="overflow-y-auto p-5 flex flex-col gap-4 scrollbar-hide">
+                  <div className="md:hidden mx-auto w-10 h-1 rounded-full bg-white/20 -mt-1 mb-1" />
+
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <UserCheck size={16} className="text-blue-400" />
+                      <span className="text-sm font-bold">Editar registro</span>
+                    </div>
+                    <span className="text-[10px] font-bold bg-red-500/20 text-red-300 border border-red-400/30 px-2 py-0.5 rounded-full whitespace-nowrap">
+                      Fila {viewingRow.filaDoc || "?"}{viewingImage.totalPages > 1 ? ` · Pág ${viewingImage.pagina}` : ""}
+                    </span>
+                  </div>
+
+                  {/* Desplegable: navegar solo entre registros FUERA (sin match) */}
+                  {(() => {
+                    const fueraRows = extractedData.filter((r) => !getMasterInfo(r.dni));
+                    return (
+                      <div>
+                        <button
+                          onClick={() => setViewerDropdownOpen((o) => !o)}
+                          className="w-full flex items-center justify-between gap-2 bg-red-500/10 hover:bg-red-500/15 border border-red-400/30 rounded-xl px-3 py-2 text-left transition-colors"
+                        >
+                          <div className="min-w-0">
+                            <p className="text-[9px] text-red-300 font-bold uppercase tracking-wider">Sin match (FUERA): {fueraRows.length}</p>
+                            <p className="text-xs font-semibold text-white truncate">
+                              {viewingRowMaster ? "Este registro ya tiene match ✓" : `Fila ${viewingRow.filaDoc || "?"} · ${viewingRow.nombre || "—"}`}
+                            </p>
+                          </div>
+                          <ChevronDown size={16} className={`text-white/60 shrink-0 transition-transform ${viewerDropdownOpen ? "rotate-180" : ""}`} />
+                        </button>
+                        {viewerDropdownOpen && (
+                          <div className="mt-1 bg-slate-800/95 border border-white/10 rounded-xl max-h-64 overflow-y-auto scrollbar-hide divide-y divide-white/5">
+                            {fueraRows.length === 0 && <p className="text-xs text-white/40 py-4 text-center">No hay registros FUERA 🎉</p>}
+                            {fueraRows.map((r) => (
+                              <button
+                                key={r.id}
+                                onClick={() => { handleViewRow(r); setViewerDropdownOpen(false); }}
+                                className={`w-full text-left px-3 py-2 hover:bg-white/5 flex items-center gap-2 transition-colors ${r.id === viewingRow.id ? "bg-red-500/15" : ""}`}
+                              >
+                                <span className="text-[10px] font-mono font-bold text-red-300 bg-red-500/15 px-1.5 py-0.5 rounded shrink-0">F{r.filaDoc || "?"}</span>
+                                <div className="min-w-0 flex-1">
+                                  <p className="text-xs font-semibold text-white truncate">{r.nombre || "—"}</p>
+                                  <p className="text-[10px] text-white/40 font-mono truncate">{r.dni || "sin DNI"} · {r.sourceFile}</p>
+                                </div>
+                                {r.id === viewingRow.id && <Check size={14} className="text-red-300 shrink-0" />}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
+
+                  <div>
+                    <p className="text-[10px] text-white/40 font-bold uppercase tracking-wider mb-1">Apellidos y Nombres (Extraído)</p>
+                    <p className="text-sm font-semibold text-white leading-snug bg-white/5 border border-white/10 rounded-xl px-3 py-2 break-words">{viewingRow.nombre || "—"}</p>
+                  </div>
+
+                  <div>
+                    <p className="text-[10px] text-white/40 font-bold uppercase tracking-wider mb-1">DNI</p>
+                    <div className="flex items-center gap-2">
+                      <input
+                        value={viewingRow.dni}
+                        onChange={(e) => applyDniToRow(viewingRow.id, e.target.value, "MANUAL")}
+                        className={`flex-1 px-3 py-2 rounded-xl border outline-none font-mono text-sm transition-all ${viewingRowMaster ? "bg-emerald-500/15 border-emerald-400/40 text-emerald-200" : "bg-red-500/15 border-red-400/40 text-red-200"}`}
+                      />
+                      <span className={`text-[10px] font-bold px-2 py-1 rounded-lg whitespace-nowrap ${viewingRowMaster ? "bg-emerald-500/20 text-emerald-300" : "bg-red-500/20 text-red-300"}`}>{viewingRowMaster ? "OK" : "FUERA"}</span>
+                    </div>
+                  </div>
+
+                  {viewingRowMaster && (
+                    <div className="bg-emerald-500/10 border border-emerald-400/20 rounded-xl p-3">
+                      <p className="text-[10px] text-emerald-300 font-bold uppercase tracking-wider mb-1 flex items-center gap-1"><Database size={10} /> Dato Maestro</p>
+                      <p className="text-sm font-semibold text-white">{viewingRowMaster.nombre}</p>
+                      <div className="flex flex-wrap gap-1.5 mt-1.5">
+                        <span className="text-[10px] bg-white/10 px-2 py-0.5 rounded font-mono text-white/70">{viewingRowMaster.dni}</span>
+                        {viewingRowMaster.cargo && <span className="text-[10px] bg-white/10 px-2 py-0.5 rounded text-white/70">{viewingRowMaster.cargo}</span>}
+                        {viewingRowMaster.area && <span className="text-[10px] bg-white/10 px-2 py-0.5 rounded text-white/70">{viewingRowMaster.area}</span>}
+                      </div>
+                    </div>
+                  )}
+
+                  {!viewingRowMaster && viewingRow.matchCandidates && viewingRow.matchCandidates.length > 0 && (
+                    <div className="flex flex-col gap-1.5">
+                      <p className="text-[10px] text-amber-300 font-bold uppercase tracking-wider">💡 Sugerencias</p>
+                      {viewingRow.matchCandidates.map((c, ci) => (
+                        <button key={ci} onClick={() => applyDniToRow(viewingRow.id, c.master.dni, "IA", c.score)} className="text-left bg-amber-500/10 hover:bg-amber-500/20 border border-amber-400/20 rounded-xl px-3 py-2 transition-colors">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-semibold text-white truncate">{c.master.nombre}</span>
+                            <span className="text-[10px] font-bold text-amber-300 shrink-0">{Math.round(c.score * 100)}%</span>
+                          </div>
+                          <span className="text-[10px] text-white/50 font-mono">{c.master.dni}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="border-t border-white/10 pt-4">
+                    <p className="text-[10px] text-white/40 font-bold uppercase tracking-wider mb-2 flex items-center gap-1"><Search size={11} /> Buscar en lista maestra</p>
+                    <div className="flex items-center gap-2 bg-white/10 border border-white/15 rounded-xl px-3 py-2 mb-2">
+                      <Search size={14} className="text-white/40 shrink-0" />
+                      <input value={viewerQuery} onChange={(e) => setViewerQuery(e.target.value)} placeholder="Nombre, apellido o DNI..." className="flex-1 bg-transparent text-white text-sm placeholder-white/40 outline-none" />
+                      {viewerQuery && <button onClick={() => setViewerQuery("")} className="text-white/40 hover:text-white"><X size={14} /></button>}
+                    </div>
+                    <div className="flex flex-col gap-1 max-h-52 md:max-h-none overflow-y-auto scrollbar-hide">
+                      {viewerQuery.trim() && viewerResults.length === 0 && (
+                        <p className="text-xs text-white/40 py-3 text-center">Sin resultados para "{viewerQuery}"</p>
+                      )}
+                      {viewerResults.map(({ master: m, score }, i) => {
+                        const isCurrent = normalizeDniStrict(m.dni) === normalizeDniStrict(viewingRow.dni) && !!normalizeDniStrict(m.dni);
+                        return (
+                          <button key={i} onClick={() => applyDniToRow(viewingRow.id, m.dni, "MANUAL")} className={`text-left rounded-xl px-3 py-2 border transition-colors ${isCurrent ? "bg-emerald-500/15 border-emerald-400/40" : "bg-white/5 hover:bg-white/10 border-white/10"}`}>
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-xs font-semibold text-white truncate">{highlightSearchMatch(m.nombre, viewerQuery)}</span>
+                              {isCurrent ? <Check size={14} className="text-emerald-400 shrink-0" /> : <span className="text-[9px] text-white/40 shrink-0">{score >= 1.5 ? '●●●' : score >= 0.8 ? '●●○' : '●○○'}</span>}
+                            </div>
+                            <span className="text-[10px] text-white/60 font-mono">{highlightSearchMatch(m.dni, normalizeDniStrict(viewerQuery).length >= 2 ? viewerQuery : '')}</span>
+                            {(m.cargo || m.area) && <span className="text-[9px] text-white/40 block truncate">{[m.cargo, m.area].filter(Boolean).join(' · ')}</span>}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              </motion.div>
+            )}
+
             {/* Hint Overlay */}
-            <div className="absolute bottom-10 left-1/2 -translate-x-1/2 flex items-center gap-6 px-8 py-4 bg-black/40 backdrop-blur-2xl rounded-3xl border border-white/10 shadow-2xl pointer-events-none opacity-60">
+            {!viewingRow && (
+            <div className="absolute bottom-10 left-1/2 -translate-x-1/2 hidden md:flex items-center gap-6 px-8 py-4 bg-black/40 backdrop-blur-2xl rounded-3xl border border-white/10 shadow-2xl pointer-events-none opacity-60">
               <div className="flex items-center gap-2 text-white/80 text-[10px] font-bold uppercase tracking-widest"><MousePointer2 size={14} className="text-blue-400" /> Rueda: Zoom</div>
               <div className="h-4 w-[1px] bg-white/10" />
               <div className="flex items-center gap-2 text-white/80 text-[10px] font-bold uppercase tracking-widest"><Grab size={14} className="text-blue-400" /> Click: Arrastrar</div>
               <div className="h-4 w-[1px] bg-white/10" />
               <div className="flex items-center gap-2 text-white/80 text-[10px] font-bold uppercase tracking-widest"><Maximize2 size={14} className="text-blue-400" /> Doble Click: Reset</div>
             </div>
+            )}
           </motion.div>
         )}
       </AnimatePresence>
