@@ -32,14 +32,15 @@ import {
   CheckCircle2, AlertCircle, FileDigit, Download, Settings, Loader2, 
   UserCheck, UserMinus, Search, SearchCode, Eye, ZoomIn, ZoomOut, Sparkles, 
   ArrowUpDown, ArrowUp, ArrowDown, Filter, ChevronDown, Check, Image as ImageIcon,
-  Maximize2, RotateCcw, MousePointer2, Grab, Menu
+  Maximize2, RotateCcw, MousePointer2, Grab, Menu, PanelLeftClose, PanelLeftOpen
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { processDocuments } from "./lib/gemini";
 import { renderPdfToImages } from "./lib/pdf";
+import { enhanceForOcr } from "./lib/imagePrep";
 import { detectDataRowBands } from "./lib/rowDetect";
 import { APP_NAME, APP_SUBTITLE, MASTER_DATA_URL } from "./config";
-import { normalizeDniStrict, nameMatchScore, dniFuzzyScore, confidenceLevel, normalizeText } from "./lib/matching";
+import { normalizeDniStrict, nameMatchScore, dniFuzzyScore, combinedMatchScore, confidenceLevel, normalizeText } from "./lib/matching";
 
 interface DocumentFile {
   id: string;
@@ -48,7 +49,11 @@ interface DocumentFile {
   mimeType: string;
   previewUrl: string | null;
   base64: string;
-  pages: string[]; // imágenes (data URL) por página; imagen = 1 página
+  pages: string[]; // imágenes (data URL) por página tal cual son; imagen = 1 página
+  // Las mismas páginas tras el preprocesado de contraste que se le manda al OCR.
+  // Son las que ve el modelo; el visor sigue mostrando `pages` (el documento real).
+  // El preprocesado no mueve píxeles, así que las coordenadas de una sirven en la otra.
+  ocrPages: { base64: string; mimeType: string }[];
 }
 
 interface BBox {
@@ -239,6 +244,7 @@ export default function App() {
   const panStartRef = useRef({ x: 0, y: 0 });
   const [bboxNudge, setBboxNudge] = useState(0); // corrección manual ±filas para la marca
   const [viewerDropdownOpen, setViewerDropdownOpen] = useState(false); // navegador de registros FUERA en el visor
+  const [viewerError, setViewerError] = useState<string | null>(null); // aviso cuando no se puede abrir el documento
 
   const [tableFilter, setTableFilter] = useState("");
   const [sortConfig, setSortConfig] = useState<{ key: string, direction: 'asc' | 'desc' } | null>(null);
@@ -247,13 +253,22 @@ export default function App() {
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  // Colapso de la barra lateral en escritorio (en móvil el panel ya se abre/cierra con isMobileMenuOpen).
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => {
+    try { return localStorage.getItem("sidebarCollapsed") === "1"; } catch { return false; }
+  });
   const [showOnlyErrors, setShowOnlyErrors] = useState(false);
-  const [activeCandidateRow, setActiveCandidateRow] = useState<number | null>(null);
+  // Se guarda el id del registro, no su posición: la lista se filtra y se ordena en vivo.
+  const [activeCandidateRow, setActiveCandidateRow] = useState<string | null>(null);
   const [editingRowId, setEditingRowId] = useState<string | null>(null);
   const [colWidths, setColWidths] = useState<Record<string, number>>({
     nro: 60, ver: 60, nombre: 200, dni: 130, estado: 80, method: 110, sourceFile: 130, filaDoc: 90, dniSheets: 130, nombreOficial: 220
   });
   const resizingRef = useRef<{ col: string; startX: number; startWidth: number } | null>(null);
+
+  useEffect(() => {
+    try { localStorage.setItem("sidebarCollapsed", isSidebarCollapsed ? "1" : "0"); } catch { /* modo privado */ }
+  }, [isSidebarCollapsed]);
 
   useEffect(() => {
     const fetchMaster = async () => {
@@ -293,6 +308,13 @@ export default function App() {
       window.removeEventListener('mouseup', handleMouseUp);
     };
   }, []);
+
+  // El aviso del visor se descarta solo.
+  useEffect(() => {
+    if (!viewerError) return;
+    const t = setTimeout(() => setViewerError(null), 6000);
+    return () => clearTimeout(t);
+  }, [viewerError]);
 
   const handleResizeStart = (col: string, clientX: number, currentWidth: number) => {
     resizingRef.current = { col, startX: clientX, startWidth: currentWidth };
@@ -337,9 +359,17 @@ export default function App() {
           }
         }
 
+        // Limpieza de sombras y contraste antes de mandarlo al OCR (visión clásica).
+        const ocrPages = await Promise.all(
+          pages.map(async (p) => {
+            const prep = await enhanceForOcr(p);
+            return { base64: prep.base64, mimeType: prep.mimeType };
+          })
+        );
+
         newProcessedFiles.push({
           id: Math.random().toString(36).substring(7),
-          name: f.name, size: f.size, mimeType: f.type, base64: base64Data, previewUrl, pages
+          name: f.name, size: f.size, mimeType: f.type, base64: base64Data, previewUrl, pages, ocrPages
         });
       } catch (err) { console.error("Error processing file:", f.name, err); }
     }
@@ -356,7 +386,19 @@ export default function App() {
     setErrorMessage("");
     setExtractedData([]);
     try {
-      const inputFormats = files.map((f) => ({ data: f.base64, mimeType: f.mimeType, name: f.name }));
+      // Se envían las páginas ya limpiadas. Etiquetar cada una con su número de página
+      // además reduce que el modelo se invente el origen de cada fila.
+      const inputFormats = files.flatMap((f) => {
+        if (!f.ocrPages || f.ocrPages.length === 0) {
+          return [{ data: f.base64, mimeType: f.mimeType, name: f.name }]; // por si el preprocesado falló
+        }
+        if (f.ocrPages.length === 1) {
+          return [{ data: f.ocrPages[0].base64, mimeType: f.ocrPages[0].mimeType, name: f.name }];
+        }
+        return f.ocrPages.map((p, i) => ({
+          data: p.base64, mimeType: p.mimeType, name: `${f.name} (página ${i + 1})`,
+        }));
+      });
       const result = await processDocuments(inputFormats);
       const rows = result.csv.split('\n').slice(1);
 
@@ -444,51 +486,50 @@ export default function App() {
     }
   };
 
-  // Matching multicapa: Pasada 1 → DNI fuzzy, Pasada 2 → Nombre compuesto
+  // Vinculación local (sin IA) en una sola pasada: por cada registro se puntúan a la vez
+  // el DNI y el nombre contra toda la maestra y se fusionan ambas señales. Dos indicios
+  // medios que apuntan a la misma persona valen más que uno solo, así que casos que antes
+  // se quedaban FUERA (DNI con 2 dígitos mal + nombre a medio leer) ahora se resuelven.
+  const UMBRAL_AUTO = 0.78;      // aplica el match sin preguntar
+  const UMBRAL_SUGERENCIA = 0.60; // por debajo no se ofrece nada
+  const MARGEN_MINIMO = 0.05;    // ventaja exigida al 1º sobre el 2º para aplicar solo
+
   const tryFuzzyMatch = () => {
-    const updated = [...extractedData];
     let matchesFound = 0;
     let suggestionsFound = 0;
+    let ambiguas = 0;
 
-    // Pasada 1: DNI fuzzy (1 dígito OCR erróneo tolerado)
-    updated.forEach((row: ExtractedRow, idx: number) => {
-      if (getMasterInfo(row.dni)) return;
-      if (!row.dni || row.dni.length < 6) return;
-      let bestMatch: MasterRow | null = null;
-      let bestScore = 0;
-      masterData.forEach((m: MasterRow) => {
-        const score = dniFuzzyScore(row.dni, m.dni);
-        if (score > bestScore) { bestScore = score; bestMatch = m; }
-      });
-      if (bestMatch && bestScore >= 0.875) {
-        updated[idx] = { ...updated[idx], dni: bestMatch.dni, method: "IA" as MatchMethod, matchConfidence: bestScore, matchCandidates: undefined };
-        matchesFound++;
-      }
-    });
+    const updated = extractedData.map((row: ExtractedRow) => {
+      if (getMasterInfo(row.dni)) return row;              // ya está resuelto
+      const usaDni = !!row.dni && row.dni.length >= 6;
+      const usaNombre = !!row.nombre && row.nombre.length >= 4;
+      if (!usaDni && !usaNombre) return row;
 
-    // Pasada 2: Nombre compuesto (Jaro-Winkler + token-set, agnóstico al orden)
-    updated.forEach((row: ExtractedRow, idx: number) => {
-      if (getMasterInfo(row.dni)) return;
-      if (!row.nombre || row.nombre.length < 4) return;
+      const candidates = masterData
+        .map((m: MasterRow) => ({
+          master: m,
+          score: combinedMatchScore(
+            usaDni ? dniFuzzyScore(row.dni, m.dni) : 0,
+            usaNombre ? nameMatchScore(row.nombre, m.nombre) : 0
+          ),
+        }))
+        .filter((c) => c.score >= UMBRAL_SUGERENCIA)
+        .sort((a, b) => b.score - a.score);
 
-      const candidates: { master: MasterRow; score: number }[] = [];
-      masterData.forEach((m: MasterRow) => {
-        const score = nameMatchScore(row.nombre, m.nombre);
-        if (score >= 0.60) candidates.push({ master: m, score });
-      });
-      candidates.sort((a, b) => b.score - a.score);
+      if (candidates.length === 0) return row;
       const top3 = candidates.slice(0, 3);
-
-      if (top3.length === 0) return;
-
       const best = top3[0];
-      if (best.score >= 0.78) {
-        updated[idx] = { ...updated[idx], dni: best.master.dni, method: "IA" as MatchMethod, matchConfidence: best.score, matchCandidates: top3 };
+      // Si el segundo candidato está pegado al primero, la elección no está clara:
+      // se deja como sugerencia para que decida una persona en vez de arriesgar.
+      const margenSuficiente = top3.length < 2 || best.score - top3[1].score >= MARGEN_MINIMO;
+
+      if (best.score >= UMBRAL_AUTO && margenSuficiente) {
         matchesFound++;
-      } else {
-        updated[idx] = { ...updated[idx], matchCandidates: top3 };
-        suggestionsFound++;
+        return { ...row, dni: best.master.dni, method: "IA" as MatchMethod, matchConfidence: best.score, matchCandidates: top3 };
       }
+      if (best.score >= UMBRAL_AUTO) ambiguas++;
+      suggestionsFound++;
+      return { ...row, matchCandidates: top3 };
     });
 
     setExtractedData(updated);
@@ -496,6 +537,7 @@ export default function App() {
       const parts = [];
       if (matchesFound > 0) parts.push(`${matchesFound} coincidencias aplicadas`);
       if (suggestionsFound > 0) parts.push(`${suggestionsFound} sugerencias para revisar`);
+      if (ambiguas > 0) parts.push(`${ambiguas} con dos candidatos casi iguales`);
       alert(parts.join(" · ") + ".");
     } else {
       alert("No se encontraron nuevas coincidencias.");
@@ -522,25 +564,68 @@ export default function App() {
     return [header, ...bodyRows].join('\n');
   };
 
+  // Quita solo la última extensión: "CamScanner 02-08 16.45.jpeg" → "camscanner 02-08 16.45".
+  const fileStem = (name: string) => name.toLowerCase().trim().replace(/\.[^.]+$/, "");
+
+  // La IA no siempre repite el nombre real del archivo en SourceFile: a veces inventa
+  // nombres sintéticos por página ("page 2.jpeg"). Cuando ese nombre no corresponde a
+  // ningún documento cargado, el número que trae suele ser la página real.
+  const pageHintFromName = (filename: string): number | null => {
+    const m = /(?:p[áa]g(?:ina)?|page|pag|hoja|img|image|scan)[\s._-]*(\d{1,3})/i.exec(filename || "");
+    const n = m ? parseInt(m[1], 10) : NaN;
+    return !isNaN(n) && n >= 1 ? n : null;
+  };
+
+  // Resuelve el documento de origen de una fila tolerando que SourceFile no coincida
+  // exactamente con el nombre del archivo cargado.
   const findSourceFile = (filename: string): DocumentFile | undefined => {
+    if (files.length === 0) return undefined;
+    // Con un único documento cargado no hay ambigüedad posible: la fila sale de ese.
+    if (files.length === 1) return files[0];
     if (!filename) return undefined;
-    const base = filename.toLowerCase().split('.')[0];
-    return files.find((f: DocumentFile) => f.name.toLowerCase().includes(base)) || files.find((f: DocumentFile) => f.name.toLowerCase() === filename.toLowerCase());
+    const target = filename.toLowerCase().trim();
+    const targetStem = fileStem(filename);
+    return (
+      files.find((f: DocumentFile) => f.name.toLowerCase().trim() === target) ||
+      files.find((f: DocumentFile) => fileStem(f.name) === targetStem) ||
+      files.find((f: DocumentFile) => !!targetStem && (fileStem(f.name).includes(targetStem) || targetStem.includes(fileStem(f.name))))
+    );
+  };
+
+  // Páginas navegables del documento (un PDF que no se pudo rasterizar cae a su preview).
+  const pagesOf = (file: DocumentFile): string[] =>
+    file.pages && file.pages.length > 0 ? file.pages : file.previewUrl ? [file.previewUrl] : [];
+
+  // Índice (base 0) de la página donde vive la fila. Compartido por el visor y por la
+  // detección de renglones para que ambos apunten siempre a la misma imagen.
+  const resolvePageIdx = (file: DocumentFile, filename: string, pagina: string): number => {
+    const total = Math.max(1, pagesOf(file).length);
+    const hint = fileStem(file.name) === fileStem(filename || "") ? null : pageHintFromName(filename);
+    const paginaNum = parseInt(pagina || "1", 10) || 1;
+    const pageNum = hint && paginaNum <= 1 ? hint : paginaNum;
+    return Math.min(Math.max(0, pageNum - 1), total - 1);
   };
 
   const openViewer = (filename: string, pagina: string, bbox: BBox | null, fila: string, rowId: string | null) => {
     const file = findSourceFile(filename);
-    if (!file || !file.pages || file.pages.length === 0) {
-      if (file && file.previewUrl) {
-        setViewingImage({ url: file.previewUrl, name: file.name, bbox: null, fila: "", pagina: "1", totalPages: 1, rowId });
-        setZoomLevel(1); setPanOffset({ x: 0, y: 0 }); setBboxNudge(0);
-      }
+    // Nunca fallar en silencio: el botón "ojo" siempre debe responder algo.
+    if (!file) {
+      setViewerError(
+        files.length === 0
+          ? "No hay documentos cargados. Vuelve a subir el archivo para poder verlo."
+          : `No se pudo ubicar el documento de origen «${filename || "sin nombre"}» entre los archivos cargados.`
+      );
       return;
     }
-    const pageIdx = Math.max(0, (parseInt(pagina || "1", 10) || 1) - 1);
-    const safeIdx = Math.min(pageIdx, file.pages.length - 1);
-    setViewingImage({ url: file.pages[safeIdx], name: file.name, bbox, fila, pagina: String(safeIdx + 1), totalPages: file.pages.length, rowId });
+    const pages = pagesOf(file);
+    if (pages.length === 0) {
+      setViewerError(`«${file.name}» no se pudo convertir a imagen, así que no hay vista previa disponible.`);
+      return;
+    }
+    const safeIdx = resolvePageIdx(file, filename, pagina);
+    setViewingImage({ url: pages[safeIdx], name: file.name, bbox, fila, pagina: String(safeIdx + 1), totalPages: pages.length, rowId });
     setZoomLevel(1); setPanOffset({ x: 0, y: 0 }); setBboxNudge(0);
+    setViewerError(null);
   };
 
   // Abre el documento marcando la fila exacta del registro, con panel de edición.
@@ -552,12 +637,14 @@ export default function App() {
     const fila = parseInt(row.filaDoc, 10);
     if (isNaN(fila) || fila < 1) return;
     const file = findSourceFile(row.sourceFile);
-    if (!file || !file.pages?.length) return;
-    const pageIdx = Math.min(Math.max(0, (parseInt(row.pagina || "1", 10) || 1) - 1), file.pages.length - 1);
+    if (!file) return;
+    const pages = pagesOf(file);
+    if (pages.length === 0) return;
+    const pageIdx = resolvePageIdx(file, row.sourceFile, row.pagina);
 
     const xMin = row.bbox ? row.bbox.xmin / 1000 : 0.03;
     const xMax = row.bbox ? row.bbox.xmax / 1000 : 0.97;
-    const bands = await detectDataRowBands(file.pages[pageIdx], xMin, xMax, row.rowTotal);
+    const bands = await detectDataRowBands(pages[pageIdx], xMin, xMax, row.rowTotal);
     if (!bands || !bands.length) return;
 
     // Alineado desde abajo: si el grid detectado incluye la fila de títulos al inicio,
@@ -737,7 +824,9 @@ export default function App() {
         )}
       </AnimatePresence>
 
-      <aside className={`fixed inset-y-0 left-0 z-50 transform ${isMobileMenuOpen ? 'translate-x-0' : '-translate-x-full'} md:relative md:translate-x-0 w-[300px] md:w-[360px] flex-shrink-0 bg-white border-r border-slate-200 flex flex-col items-stretch overflow-hidden shadow-2xl md:shadow-xl transition-transform duration-300 ease-in-out`}>
+      <aside className={`fixed inset-y-0 left-0 z-50 transform ${isMobileMenuOpen ? 'translate-x-0' : '-translate-x-full'} md:relative md:translate-x-0 w-[300px] ${isSidebarCollapsed ? 'md:w-0 md:border-r-0 md:shadow-none' : 'md:w-[360px]'} flex-shrink-0 bg-white border-r border-slate-200 flex flex-col items-stretch overflow-hidden shadow-2xl md:shadow-xl transition-all duration-300 ease-in-out`}>
+        {/* Ancho fijo interior: evita que el contenido se comprima mientras el panel se colapsa. */}
+        <div className="w-[300px] md:w-[360px] h-full flex flex-col flex-shrink-0">
         <div className="px-6 py-6 border-b border-slate-100 flex items-center justify-between gap-3">
           <div className="flex items-center gap-3">
             <div className="p-2 bg-blue-100 text-blue-600 rounded-lg"><FileDigit size={24} /></div>
@@ -748,6 +837,13 @@ export default function App() {
           </div>
           <button className="md:hidden p-2 text-slate-400 hover:text-slate-600 bg-slate-50 rounded-full" onClick={() => setIsMobileMenuOpen(false)}>
             <X size={20} />
+          </button>
+          <button
+            className="hidden md:flex p-2 text-slate-400 hover:text-blue-600 hover:bg-blue-50 bg-slate-50 rounded-full transition-colors flex-shrink-0"
+            onClick={() => setIsSidebarCollapsed(true)}
+            title="Ocultar panel lateral"
+          >
+            <PanelLeftClose size={20} />
           </button>
         </div>
         <div className="flex-1 overflow-y-auto p-6 scrollbar-hide">
@@ -781,6 +877,7 @@ export default function App() {
             {status === "processing" ? <Loader2 size={18} className="animate-spin" /> : <Play size={18} fill="currentColor" />} Iniciar Extracción
           </button>
         </div>
+        </div>
       </aside>
 
       <main className="flex-1 overflow-hidden flex flex-col bg-[#FAFAFA] w-full">
@@ -800,6 +897,15 @@ export default function App() {
         <header className="flex-shrink-0 bg-white border-b border-slate-200 px-4 md:px-8 py-4 flex flex-col lg:flex-row items-start lg:items-center justify-between shadow-sm z-10 gap-4">
           <div className="flex items-center gap-4 w-full lg:w-auto justify-between">
             <h2 className="text-lg font-semibold text-slate-800 hidden md:flex items-center gap-3">
+              {isSidebarCollapsed && (
+                <button
+                  onClick={() => setIsSidebarCollapsed(false)}
+                  title="Mostrar panel lateral"
+                  className="p-2 -ml-2 text-slate-500 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors flex-shrink-0"
+                >
+                  <PanelLeftOpen size={20} />
+                </button>
+              )}
               Panel de Resultados
               {extractedData.length > 0 && (
                 <div className="flex items-center gap-2">
@@ -900,7 +1006,7 @@ export default function App() {
               
               {/* VISTA MÓVIL: TARJETAS */}
               <div className="md:hidden flex flex-col gap-4">
-                {displayedData.map((row, idx) => {
+                {displayedData.map((row) => {
                   const master = getMasterInfo(row.dni);
                   const isValid = !!master;
                   return (
@@ -942,12 +1048,12 @@ export default function App() {
                         {!isValid && row.matchCandidates && row.matchCandidates.length > 0 && (
                           <div className="relative">
                             <button
-                              onClick={() => setActiveCandidateRow(activeCandidateRow === idx ? null : idx)}
+                              onClick={() => setActiveCandidateRow(activeCandidateRow === row.id ? null : row.id)}
                               className="text-[10px] font-bold text-amber-700 bg-amber-50 border border-amber-200 px-2 py-1 rounded-lg hover:bg-amber-100 transition-colors"
                             >
                               💡 {row.matchCandidates.length} sugerencia{row.matchCandidates.length > 1 ? "s" : ""}
                             </button>
-                            {activeCandidateRow === idx && (
+                            {activeCandidateRow === row.id && (
                               <div className="absolute left-0 top-full mt-1 z-50 bg-white border border-amber-200 rounded-xl shadow-lg p-2 min-w-[240px]">
                                 {row.matchCandidates.map((c, ci) => (
                                   <button key={ci} onClick={() => {
@@ -1015,7 +1121,7 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 font-mono">
-                      {displayedData.map((row, idx) => {
+                      {displayedData.map((row) => {
                         const master = getMasterInfo(row.dni);
                         const isValid = !!master;
                         return (
@@ -1058,12 +1164,12 @@ export default function App() {
                                 {!isValid && row.matchCandidates && row.matchCandidates.length > 0 && (
                                   <div className="relative">
                                     <button
-                                      onClick={() => setActiveCandidateRow(activeCandidateRow === idx ? null : idx)}
+                                      onClick={() => setActiveCandidateRow(activeCandidateRow === row.id ? null : row.id)}
                                       className="text-[9px] font-bold text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded hover:bg-amber-100 transition-colors"
                                     >
                                       💡 {row.matchCandidates.length}
                                     </button>
-                                    {activeCandidateRow === idx && (
+                                    {activeCandidateRow === row.id && (
                                       <div className="absolute right-0 top-full mt-1 z-50 bg-white border border-amber-200 rounded-xl shadow-lg p-2 min-w-[260px]">
                                         {row.matchCandidates.map((c, ci) => (
                                           <button key={ci} onClick={() => {
@@ -1155,6 +1261,20 @@ export default function App() {
           )}
         </AnimatePresence>
       </main>
+
+      {/* Aviso cuando no se puede abrir el documento de una fila */}
+      <AnimatePresence>
+        {viewerError && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }}
+            className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[300] max-w-[92vw] md:max-w-md bg-slate-900 text-white rounded-2xl shadow-2xl border border-white/10 px-4 py-3 flex items-start gap-3"
+          >
+            <AlertCircle size={18} className="text-amber-400 shrink-0 mt-0.5" />
+            <p className="text-xs leading-relaxed flex-1">{viewerError}</p>
+            <button onClick={() => setViewerError(null)} className="text-white/50 hover:text-white shrink-0 transition-colors"><X size={16} /></button>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* REIMAGINED ZOOM VIEWER */}
       <AnimatePresence>
