@@ -57,6 +57,10 @@ export async function processDocuments(files: { data: string; mimeType: string; 
       }
 
       console.log(`¡Éxito con el modelo ${modelName}!`);
+      // Respuesta cruda a la consola: cuando una extracción sale mal, es la única
+      // forma de distinguir si el modelo leyó mal el documento o si el fallo está
+      // en cómo la app interpreta el CSV.
+      console.log("=== CSV devuelto por el modelo ===\n" + text);
       return {
         csv: text,
         modelUsed: modelName,

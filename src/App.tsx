@@ -31,7 +31,7 @@ import {
   Upload, FileText, X, Play, Copy, Database, 
   CheckCircle2, AlertCircle, FileDigit, Download, Settings, Loader2, 
   UserCheck, UserMinus, Search, SearchCode, Eye, ZoomIn, ZoomOut, Sparkles, 
-  ArrowUpDown, ArrowUp, ArrowDown, Filter, ChevronDown, Check, Image as ImageIcon,
+  ArrowUpDown, ArrowUp, ArrowDown, Filter, ChevronDown, ChevronLeft, ChevronRight, Check, Image as ImageIcon,
   Maximize2, RotateCcw, MousePointer2, Grab, Menu, PanelLeftClose, PanelLeftOpen
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
@@ -218,6 +218,7 @@ export default function App() {
   const [status, setStatus] = useState<"idle" | "processing" | "success" | "error">("idle");
   const [extractedData, setExtractedData] = useState<ExtractedRow[]>([]);
   const [masterData, setMasterData] = useState<MasterRow[]>([]);
+  const [masterStatus, setMasterStatus] = useState<"cargando" | "ok" | "error">("cargando");
   const [modelUsed, setModelUsed] = useState<string>("");
   const [errorMessage, setErrorMessage] = useState<string>("");
   const [isApiKeyMissing, setIsApiKeyMissing] = useState<boolean>(false);
@@ -251,6 +252,11 @@ export default function App() {
   const [activeFilters, setActiveFilters] = useState<{ [key: string]: string[] }>({});
   const [openFilterMenu, setOpenFilterMenu] = useState<string | null>(null);
   
+  // Avance de la carga de documentos (leer → rasterizar páginas → limpiar imagen).
+  const [uploadProgress, setUploadProgress] = useState<{
+    archivo: string; indice: number; total: number; pct: number; fase: string;
+  } | null>(null);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   // Colapso de la barra lateral en escritorio (en móvil el panel ya se abre/cierra con isMobileMenuOpen).
@@ -262,7 +268,9 @@ export default function App() {
   const [activeCandidateRow, setActiveCandidateRow] = useState<string | null>(null);
   const [editingRowId, setEditingRowId] = useState<string | null>(null);
   const [colWidths, setColWidths] = useState<Record<string, number>>({
-    nro: 60, ver: 60, nombre: 200, dni: 130, estado: 80, method: 110, sourceFile: 130, filaDoc: 90, dniSheets: 130, nombreOficial: 220
+    // El DNI son 8 dígitos en fuente monoespaciada: con 130 px la caja los recortaba
+    // y solo se veían 6, que parecían DNIs mal leídos sin serlo.
+    nro: 60, ver: 60, nombre: 200, dni: 170, estado: 80, method: 110, sourceFile: 130, filaDoc: 90, dniSheets: 130, nombreOficial: 220
   });
   const resizingRef = useRef<{ col: string; startX: number; startWidth: number } | null>(null);
 
@@ -270,13 +278,18 @@ export default function App() {
     try { localStorage.setItem("sidebarCollapsed", isSidebarCollapsed ? "1" : "0"); } catch { /* modo privado */ }
   }, [isSidebarCollapsed]);
 
-  useEffect(() => {
-    const fetchMaster = async () => {
+  // Sin lista maestra no hay contra qué cruzar y TODOS los registros salen FUERA. Antes
+  // el fallo solo se escribía en la consola, así que parecía que la app no reconocía a
+  // nadie cuando en realidad no tenía con quién comparar. Ahora se reintenta y se avisa.
+  const cargarMaestra = useCallback(async (intentos = 3) => {
+    setMasterStatus("cargando");
+    for (let i = 0; i < intentos; i++) {
       try {
         const response = await fetch(MASTER_DATA_URL);
+        if (!response.ok) throw new Error(`El servidor respondió ${response.status}`);
         const text = await response.text();
-        const rows = text.split("\n").filter(r => r.trim());
-        const parsed: MasterRow[] = rows.slice(1).map(row => {
+        const rows = text.split("\n").filter((r) => r.trim());
+        const parsed: MasterRow[] = rows.slice(1).map((row) => {
           const cols = parseCSVRow(row);
           return {
             dni: cols[0] || "",
@@ -284,14 +297,20 @@ export default function App() {
             cargo: cols[8] || "",
             area: cols[9] || ""
           };
-        }).filter(r => r.dni);
+        }).filter((r) => r.dni);
+        if (parsed.length === 0) throw new Error("La lista maestra llegó vacía");
         setMasterData(parsed);
+        setMasterStatus("ok");
+        return;
       } catch (err) {
-        console.error("Failed to load master list:", err);
+        console.error(`Fallo al cargar la lista maestra (intento ${i + 1}/${intentos}):`, err);
+        if (i < intentos - 1) await new Promise((r) => setTimeout(r, 800 * (i + 1)));
       }
-    };
-    fetchMaster();
+    }
+    setMasterStatus("error");
   }, []);
+
+  useEffect(() => { cargarMaestra(); }, [cargarMaestra]);
 
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
@@ -329,9 +348,23 @@ export default function App() {
   const handleFilesAdded = async (newFiles: FileList | null) => {
     if (!newFiles || newFiles.length === 0) return;
     const validFiles = Array.from(newFiles).filter((f: File) => f.type.startsWith("image/") || f.type === "application/pdf");
+    if (validFiles.length === 0) return;
     const newProcessedFiles: DocumentFile[] = [];
-    for (const f of validFiles) {
+
+    // Reparto del avance dentro de un documento: leerlo es rápido, rasterizar las
+    // páginas es lo más lento y limpiarlas va después.
+    const FIN_LECTURA = 8, FIN_RASTER = 55;
+    // Cede el hilo para que el navegador pinte la barra antes del siguiente paso pesado.
+    const repintar = () => new Promise((r) => setTimeout(r, 0));
+
+    for (let i = 0; i < validFiles.length; i++) {
+      const f = validFiles[i];
+      const avance = async (pct: number, fase: string) => {
+        setUploadProgress({ archivo: f.name, indice: i + 1, total: validFiles.length, pct: Math.round(pct), fase });
+        await repintar();
+      };
       try {
+        await avance(0, "Leyendo archivo");
         const base64Data = await new Promise<string>((resolve, reject) => {
           const reader = new FileReader();
           reader.onload = () => resolve((reader.result as string).split(",")[1]);
@@ -340,6 +373,7 @@ export default function App() {
         });
         let pages: string[] = [];
         let previewUrl: string | null = null;
+        await avance(FIN_LECTURA, "Preparando documento");
 
         if (f.type.startsWith("image/")) {
           const dataUrl = await new Promise<string>((resolve, reject) => {
@@ -350,9 +384,16 @@ export default function App() {
           });
           pages = [dataUrl];
           previewUrl = dataUrl;
+          await avance(FIN_RASTER, "Imagen lista");
         } else if (f.type === "application/pdf") {
           try {
-            pages = await renderPdfToImages(base64Data);
+            pages = await renderPdfToImages(base64Data, 2600, (hechas, total) => {
+              const pct = FIN_LECTURA + ((FIN_RASTER - FIN_LECTURA) * hechas) / Math.max(1, total);
+              setUploadProgress({
+                archivo: f.name, indice: i + 1, total: validFiles.length,
+                pct: Math.round(pct), fase: `Procesando página ${Math.min(hechas + 1, total)} de ${total}`,
+              });
+            });
             previewUrl = pages[0] || null;
           } catch (err) {
             console.error("No se pudo renderizar el PDF:", f.name, err);
@@ -360,12 +401,16 @@ export default function App() {
         }
 
         // Limpieza de sombras y contraste antes de mandarlo al OCR (visión clásica).
-        const ocrPages = await Promise.all(
-          pages.map(async (p) => {
-            const prep = await enhanceForOcr(p);
-            return { base64: prep.base64, mimeType: prep.mimeType };
-          })
-        );
+        // En serie y no en paralelo: así el avance es real y no se dispara la memoria
+        // con un PDF de muchas hojas.
+        const ocrPages: { base64: string; mimeType: string }[] = [];
+        for (let p = 0; p < pages.length; p++) {
+          const pct = FIN_RASTER + ((100 - FIN_RASTER) * p) / Math.max(1, pages.length);
+          await avance(pct, pages.length > 1 ? `Mejorando imagen ${p + 1} de ${pages.length}` : "Mejorando imagen");
+          const prep = await enhanceForOcr(pages[p]);
+          ocrPages.push({ base64: prep.base64, mimeType: prep.mimeType });
+        }
+        await avance(100, "Listo");
 
         newProcessedFiles.push({
           id: Math.random().toString(36).substring(7),
@@ -373,6 +418,7 @@ export default function App() {
         });
       } catch (err) { console.error("Error processing file:", f.name, err); }
     }
+    setUploadProgress(null);
     if (newProcessedFiles.length > 0) {
       setFiles((prev: DocumentFile[]) => [...prev, ...newProcessedFiles]);
       setStatus("idle");
@@ -476,7 +522,11 @@ export default function App() {
         const { _tableBox, _totalFilas, ...clean } = r;
         return { ...clean, bbox, rowTotal: c?.total || 0 };
       });
-      setExtractedData(parsed);
+      // La vinculación local se aplica sola: no tiene coste (es algoritmo, no IA) y
+      // dejarla detrás de un botón hacía que el panel se abriera con todo en FUERA
+      // aunque los registros fueran perfectamente identificables.
+      const { updated } = masterData.length > 0 ? vincularRegistros(parsed) : { updated: parsed };
+      setExtractedData(updated);
       setModelUsed(result.modelUsed);
       setStatus("success");
     } catch (err: any) {
@@ -494,12 +544,14 @@ export default function App() {
   const UMBRAL_SUGERENCIA = 0.60; // por debajo no se ofrece nada
   const MARGEN_MINIMO = 0.05;    // ventaja exigida al 1º sobre el 2º para aplicar solo
 
-  const tryFuzzyMatch = () => {
+  // Núcleo de la vinculación, sin tocar estado ni avisar: así puede usarse tanto desde
+  // el botón como automáticamente al terminar una extracción.
+  const vincularRegistros = (rows: ExtractedRow[]) => {
     let matchesFound = 0;
     let suggestionsFound = 0;
     let ambiguas = 0;
 
-    const updated = extractedData.map((row: ExtractedRow) => {
+    const updated = rows.map((row: ExtractedRow) => {
       if (getMasterInfo(row.dni)) return row;              // ya está resuelto
       const usaDni = !!row.dni && row.dni.length >= 6;
       const usaNombre = !!row.nombre && row.nombre.length >= 4;
@@ -532,6 +584,11 @@ export default function App() {
       return { ...row, matchCandidates: top3 };
     });
 
+    return { updated, matchesFound, suggestionsFound, ambiguas };
+  };
+
+  const tryFuzzyMatch = () => {
+    const { updated, matchesFound, suggestionsFound, ambiguas } = vincularRegistros(extractedData);
     setExtractedData(updated);
     if (matchesFound > 0 || suggestionsFound > 0) {
       const parts = [];
@@ -647,12 +704,30 @@ export default function App() {
     const bands = await detectDataRowBands(pages[pageIdx], xMin, xMax, row.rowTotal);
     if (!bands || !bands.length) return;
 
-    // Alineado desde abajo: si el grid detectado incluye la fila de títulos al inicio,
-    // se descarta. Las N filas de datos se anclan al final del grid.
-    const N = row.rowTotal;
-    let idx = (N >= 2 && bands.length >= N) ? bands.length - N + (fila - 1) : fila - 1;
-    idx = Math.min(Math.max(0, idx), bands.length - 1);
-    const band = bands[idx];
+    // La marca interpolada a partir de los anclajes de la IA ya da la posición
+    // aproximada de la fila; el grid detectado solo debe afinar sus bordes. Por eso se
+    // elige la banda cuyo centro cae más cerca de esa posición, en vez de contar bandas
+    // por índice: contar obligaba a acertar cuántas líneas hay antes y después de la
+    // tabla, y una sola de más (la cabecera del formulario, un pie, un renglón bajo la
+    // última fila) corría la cuenta entera y la marca aterrizaba en otra fila.
+    const alturaMedia = bands.reduce((s, b) => s + (b.bottom - b.top), 0) / bands.length;
+    let band: { top: number; bottom: number } | undefined;
+
+    if (row.bbox) {
+      const centroEsperado = (row.bbox.ymin + row.bbox.ymax) / 2000; // fracción 0-1
+      let mejorDist = Infinity;
+      for (const b of bands) {
+        const d = Math.abs((b.top + b.bottom) / 2 - centroEsperado);
+        if (d < mejorDist) { mejorDist = d; band = b; }
+      }
+      // Si ni la banda más cercana queda a menos de una fila de distancia, el grid
+      // detectado no se corresponde con esta tabla: es preferible dejar la marca
+      // interpolada antes que moverla a un renglón equivocado.
+      if (mejorDist > alturaMedia * 1.2) return;
+    } else {
+      // Sin anclajes de la IA no hay referencia: se cuenta desde el inicio del grid.
+      band = bands[Math.min(Math.max(0, fila - 1), bands.length - 1)];
+    }
     if (!band) return;
 
     setViewingImage((prev) =>
@@ -806,6 +881,19 @@ export default function App() {
   );
   const viewingRowMaster = viewingRow ? getMasterInfo(viewingRow.dni) : undefined;
 
+  // Cola de revisión del visor: los registros sin match, en el orden del documento.
+  // Se incluye el que se está viendo aunque ya lo hayas resuelto, para que no se salga
+  // de la lista bajo los pies al corregir su DNI y siga habiendo un "siguiente".
+  const viewerQueue = useMemo(
+    () => extractedData.filter((r) => !getMasterInfo(r.dni) || r.id === viewingImage?.rowId),
+    [extractedData, masterData, viewingImage?.rowId]
+  );
+  const viewerQueueIdx = viewingRow ? viewerQueue.findIndex((r) => r.id === viewingRow.id) : -1;
+  const goToQueue = (delta: number) => {
+    const next = viewerQueue[viewerQueueIdx + delta];
+    if (next) handleViewRow(next);
+  };
+
   const applyDniToRow = (rowId: string, dni: string, method: MatchMethod = "MANUAL", confidence?: number) => {
     setExtractedData((prev) => prev.map((r) => (r.id === rowId ? { ...r, dni, method, matchConfidence: confidence } : r)));
   };
@@ -852,6 +940,44 @@ export default function App() {
             <p className="text-sm font-medium text-slate-700 mb-1 text-center">Añadir documentos</p>
             <input type="file" multiple accept="image/*,application/pdf" className="hidden" ref={fileInputRef} onChange={(e) => handleFilesAdded(e.target.files)} />
           </div>
+          <AnimatePresence>
+            {uploadProgress && (
+              <motion.div
+                initial={{ opacity: 0, y: -8, height: 0 }}
+                animate={{ opacity: 1, y: 0, height: "auto" }}
+                exit={{ opacity: 0, y: -8, height: 0 }}
+                className="mb-4 overflow-hidden"
+              >
+                <div className="p-4 rounded-2xl border border-blue-200 bg-blue-50/70">
+                  <div className="flex items-center justify-between gap-2 mb-1">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <Loader2 size={14} className="text-blue-600 animate-spin shrink-0" />
+                      <p className="text-xs font-semibold text-slate-800 truncate">{uploadProgress.archivo}</p>
+                    </div>
+                    <span className="text-sm font-black text-blue-600 tabular-nums shrink-0">{uploadProgress.pct}%</span>
+                  </div>
+
+                  <div className="w-full h-2 bg-blue-100 rounded-full overflow-hidden mt-2">
+                    <motion.div
+                      className="h-full bg-blue-600 rounded-full"
+                      animate={{ width: `${uploadProgress.pct}%` }}
+                      transition={{ ease: "easeOut", duration: 0.25 }}
+                    />
+                  </div>
+
+                  <div className="flex items-center justify-between gap-2 mt-1.5">
+                    <p className="text-[10px] text-slate-500 truncate">{uploadProgress.fase}</p>
+                    {uploadProgress.total > 1 && (
+                      <p className="text-[10px] font-bold text-slate-400 shrink-0">
+                        {uploadProgress.indice}/{uploadProgress.total} archivos
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
           <div className="space-y-3">
             {files.map((f) => (
               <div key={f.id} onDoubleClick={() => handleViewSource(f.name)} className="group relative flex items-center p-3 rounded-xl border border-slate-200 bg-white shadow-sm hover:shadow-md transition-shadow cursor-pointer select-none">
@@ -873,8 +999,33 @@ export default function App() {
               <p className="text-[10px] font-medium leading-tight">Configura VITE_GEMINI_API_KEY en Vercel</p>
             </div>
           )}
-          <button disabled={files.length === 0 || status === "processing" || isApiKeyMissing} onClick={executeExtraction} className="w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-200 disabled:text-slate-400 text-white shadow-sm font-semibold rounded-xl py-3.5 transition-all text-sm">
-            {status === "processing" ? <Loader2 size={18} className="animate-spin" /> : <Play size={18} fill="currentColor" />} Iniciar Extracción
+
+          {/* Estado de la lista maestra: si no cargó, todo saldría FUERA sin explicación */}
+          {masterStatus === "error" ? (
+            <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-xl flex items-start gap-2 text-red-700">
+              <AlertCircle size={16} className="flex-shrink-0 mt-0.5" />
+              <div className="min-w-0">
+                <p className="text-[11px] font-bold leading-tight">No se pudo cargar la lista maestra</p>
+                <p className="text-[10px] leading-snug mt-0.5 opacity-90">Sin ella no hay con quién comparar y todos los registros saldrán FUERA.</p>
+                <button onClick={() => cargarMaestra()} className="mt-2 text-[10px] font-bold uppercase tracking-wider bg-red-600 text-white px-2.5 py-1 rounded-lg hover:bg-red-700 transition-colors">
+                  Reintentar
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="mb-4 flex items-center gap-2 text-[10px] font-medium text-slate-500">
+              {masterStatus === "cargando" ? (
+                <><Loader2 size={12} className="animate-spin text-blue-500 shrink-0" /> Cargando lista maestra…</>
+              ) : (
+                <><CheckCircle2 size={12} className="text-emerald-500 shrink-0" /> Lista maestra: {masterData.length} personas</>
+              )}
+            </div>
+          )}
+          {/* Se bloquea mientras se cargan documentos: aún no están en `files` y se
+              extraería con la lista incompleta. */}
+          <button disabled={files.length === 0 || status === "processing" || isApiKeyMissing || !!uploadProgress} onClick={executeExtraction} className="w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-200 disabled:text-slate-400 text-white shadow-sm font-semibold rounded-xl py-3.5 transition-all text-sm">
+            {status === "processing" || uploadProgress ? <Loader2 size={18} className="animate-spin" /> : <Play size={18} fill="currentColor" />}
+            {uploadProgress ? "Cargando documentos…" : "Iniciar Extracción"}
           </button>
         </div>
         </div>
@@ -1131,11 +1282,12 @@ export default function App() {
                               <button onClick={() => handleViewRow(row)} className="p-1.5 text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"><Eye size={16} /></button>
                             </td>
                             <td className="px-6 py-3 truncate max-w-[180px] text-slate-800">{highlightMatch(row.nombre, tableFilter)}</td>
-                            <td className="px-6 py-3">
-                              <input type="text" value={row.dni} onChange={(e) => {
+                            {/* px-2 en vez de px-6: el margen de la celda se lo comía el DNI */}
+                            <td className="px-2 py-3">
+                              <input type="text" value={row.dni} title={row.dni} onChange={(e) => {
                                 const updated = extractedData.map(r => r.id === row.id ? { ...r, dni: e.target.value, method: "MANUAL" as MatchMethod } : r);
                                 setExtractedData(updated);
-                              }} onFocus={() => setEditingRowId(row.id)} onBlur={() => setEditingRowId(null)} className={`w-full px-2 py-1 rounded border outline-none transition-all font-mono text-sm ${isValid ? "bg-emerald-50 border-emerald-200 text-emerald-800" : "bg-red-50 border-red-200 text-red-800"}`} />
+                              }} onFocus={() => setEditingRowId(row.id)} onBlur={() => setEditingRowId(null)} className={`w-full min-w-[104px] px-2 py-1 rounded border outline-none transition-all font-mono text-sm tracking-tight ${isValid ? "bg-emerald-50 border-emerald-200 text-emerald-800" : "bg-red-50 border-red-200 text-red-800"}`} />
                               {/* Resaltado visual en el input del DNI */}
                               {tableFilter && row.dni.toLowerCase().includes(tableFilter.toLowerCase()) && (
                                 <div style={{ position: 'absolute', right: 8, top: 8, pointerEvents: 'none' }}>
@@ -1400,18 +1552,45 @@ export default function App() {
                     const fueraRows = extractedData.filter((r) => !getMasterInfo(r.dni));
                     return (
                       <div>
-                        <button
-                          onClick={() => setViewerDropdownOpen((o) => !o)}
-                          className="w-full flex items-center justify-between gap-2 bg-red-500/10 hover:bg-red-500/15 border border-red-400/30 rounded-xl px-3 py-2 text-left transition-colors"
-                        >
-                          <div className="min-w-0">
-                            <p className="text-[9px] text-red-300 font-bold uppercase tracking-wider">Sin match (FUERA): {fueraRows.length}</p>
-                            <p className="text-xs font-semibold text-white truncate">
-                              {viewingRowMaster ? "Este registro ya tiene match ✓" : `Fila ${viewingRow.filaDoc || "?"} · ${viewingRow.nombre || "—"}`}
-                            </p>
+                        <div className="flex items-stretch gap-1.5">
+                          <button
+                            onClick={() => setViewerDropdownOpen((o) => !o)}
+                            className="flex-1 min-w-0 flex items-center justify-between gap-2 bg-red-500/10 hover:bg-red-500/15 border border-red-400/30 rounded-xl px-3 py-2 text-left transition-colors"
+                          >
+                            <div className="min-w-0">
+                              <p className="text-[9px] text-red-300 font-bold uppercase tracking-wider">Sin match (FUERA): {fueraRows.length}</p>
+                              <p className="text-xs font-semibold text-white truncate">
+                                {viewingRowMaster ? "Este registro ya tiene match ✓" : `Fila ${viewingRow.filaDoc || "?"} · ${viewingRow.nombre || "—"}`}
+                              </p>
+                            </div>
+                            <ChevronDown size={16} className={`text-white/60 shrink-0 transition-transform ${viewerDropdownOpen ? "rotate-180" : ""}`} />
+                          </button>
+
+                          {/* Recorrer la cola de revisión sin abrir el desplegable */}
+                          <div className="flex items-center gap-1 shrink-0">
+                            <button
+                              onClick={() => goToQueue(-1)}
+                              disabled={viewerQueueIdx <= 0}
+                              title="Registro anterior"
+                              className="h-full px-2 rounded-xl border border-white/15 bg-white/5 text-white/80 hover:bg-white/10 hover:text-white disabled:opacity-30 disabled:hover:bg-white/5 transition-colors"
+                            >
+                              <ChevronLeft size={18} />
+                            </button>
+                            <button
+                              onClick={() => goToQueue(1)}
+                              disabled={viewerQueueIdx < 0 || viewerQueueIdx >= viewerQueue.length - 1}
+                              title="Registro siguiente"
+                              className="h-full px-2 rounded-xl border border-white/15 bg-white/5 text-white/80 hover:bg-white/10 hover:text-white disabled:opacity-30 disabled:hover:bg-white/5 transition-colors"
+                            >
+                              <ChevronRight size={18} />
+                            </button>
                           </div>
-                          <ChevronDown size={16} className={`text-white/60 shrink-0 transition-transform ${viewerDropdownOpen ? "rotate-180" : ""}`} />
-                        </button>
+                        </div>
+                        {viewerQueueIdx >= 0 && viewerQueue.length > 1 && (
+                          <p className="text-[9px] text-white/35 font-bold text-center mt-1 tabular-nums">
+                            {viewerQueueIdx + 1} de {viewerQueue.length} por revisar
+                          </p>
+                        )}
                         {viewerDropdownOpen && (
                           <div className="mt-1 bg-slate-800/95 border border-white/10 rounded-xl max-h-64 overflow-y-auto scrollbar-hide divide-y divide-white/5">
                             {fueraRows.length === 0 && <p className="text-xs text-white/40 py-4 text-center">No hay registros FUERA 🎉</p>}

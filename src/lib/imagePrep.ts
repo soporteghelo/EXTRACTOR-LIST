@@ -47,7 +47,10 @@ function partirDataUrl(dataUrl: string): ImagenPreparada {
  *
  * Si algo falla, devuelve la imagen original: preprocesar nunca debe impedir extraer.
  */
-export async function enhanceForOcr(dataUrl: string, maxSide = 2400): Promise<ImagenPreparada> {
+// `maxSide` va alineado con la resolución a la que se rasterizan las páginas de PDF:
+// si aquí se recortase por debajo, se perdería justo el detalle que allí se busca.
+// Los dígitos manuscritos en casillas necesitan píxeles; quedarse corto los vuelve ilegibles.
+export async function enhanceForOcr(dataUrl: string, maxSide = 2600): Promise<ImagenPreparada> {
   try {
     const img = await cargarImagen(dataUrl);
     const W0 = img.naturalWidth, H0 = img.naturalHeight;
