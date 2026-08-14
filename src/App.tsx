@@ -1,0 +1,2096 @@
+// URL del Apps Script Web App (reemplaza por tu URL real)
+const GOOGLE_SHEETS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbyohGM8PRErgAK4Uq_SXw0b4gQwuCqbV2O9CC64UAS1piAurb9oiZQ2kQiv4YwOn3GL/exec";
+// Función para resaltar coincidencias en texto
+function highlightMatch(text: string, query: string) {
+  if (!query) return text;
+  const regex = new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "gi");
+  return text.split(regex).map((part, i) =>
+    part.toLowerCase() === query.toLowerCase() ? (
+      <mark key={i} style={{ background: "#ffe066", padding: 0 }}>{part}</mark>
+    ) : part
+  );
+}
+function highlightSearchMatch(text: string, query: string): React.ReactNode {
+  if (!query.trim()) return text;
+  const tokens = query.trim().split(/\s+/).filter(t => t.length >= 2);
+  if (tokens.length === 0) return text;
+  const escaped = tokens.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  const parts = text.split(new RegExp(`(${escaped})`, "gi"));
+  return parts.map((part, i) =>
+    i % 2 === 1
+      ? <mark key={i} style={{ background: "#bfdbfe", padding: 0, borderRadius: 2, fontWeight: 700 }}>{part}</mark>
+      : part
+  );
+}
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+import React, { useState, useRef, useEffect, useMemo, useCallback } from "react";
+import { 
+  Upload, FileText, X, Play, Copy, Database, 
+  CheckCircle2, AlertCircle, FileDigit, Download, Settings, Loader2, 
+  UserCheck, UserMinus, Search, SearchCode, Eye, ZoomIn, ZoomOut, Sparkles, 
+  ArrowUpDown, ArrowUp, ArrowDown, Filter, ChevronDown, ChevronLeft, ChevronRight, Check, Image as ImageIcon,
+  Maximize2, RotateCcw, MousePointer2, Grab, Menu, PanelLeftClose, PanelLeftOpen
+} from "lucide-react";
+import { motion, AnimatePresence } from "motion/react";
+import { processDocuments, releerFilas } from "./lib/gemini";
+import { recortarFilas, type RecorteFila } from "./lib/rowCrop";
+import { copiarTexto } from "./lib/clipboard";
+import { renderPdfToImages } from "./lib/pdf";
+import { enhanceForOcr } from "./lib/imagePrep";
+import { detectDataRowBands } from "./lib/rowDetect";
+import { APP_NAME, APP_SUBTITLE, MASTER_DATA_URL } from "./config";
+import { normalizeDniStrict, nameMatchScore, dniFuzzyScore, combinedMatchScore, confidenceLevel, normalizeText } from "./lib/matching";
+
+interface DocumentFile {
+  id: string;
+  name: string;
+  size: number;
+  mimeType: string;
+  previewUrl: string | null;
+  base64: string;
+  pages: string[]; // imágenes (data URL) por página tal cual son; imagen = 1 página
+  // Las mismas páginas tras el preprocesado de contraste que se le manda al OCR.
+  // Son las que ve el modelo; el visor sigue mostrando `pages` (el documento real).
+  // El preprocesado no mueve píxeles, así que las coordenadas de una sirven en la otra.
+  ocrPages: { base64: string; mimeType: string }[];
+}
+
+interface BBox {
+  ymin: number;
+  xmin: number;
+  ymax: number;
+  xmax: number;
+}
+
+type MatchMethod = "DEFAULT" | "MANUAL" | "IA";
+
+interface ExtractedRow {
+  id: string;
+  nro: string;
+  nombre: string;
+  dni: string;
+  ocupacion: string;
+  area: string;
+  sourceFile: string;
+  filaDoc: string;
+  pagina: string;
+  bbox: BBox | null;
+  rowTotal: number; // total de renglones de su página (para detección de grid)
+  method: MatchMethod;
+  matchConfidence?: number;
+  matchCandidates?: { master: MasterRow; score: number }[];
+}
+
+interface MasterRow {
+  dni: string;
+  nombre: string;
+  cargo: string;
+  area: string;
+}
+
+function parseCSVRow(row: string) {
+  const result = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < row.length; i++) {
+    const char = row[i];
+    if (char === '"') inQuotes = !inQuotes;
+    else if (char === ',' && !inQuotes) {
+      result.push(current.trim());
+      current = "";
+    } else {
+      current += char;
+    }
+  }
+  result.push(current.trim());
+  return result;
+}
+
+// Parsea "ymin,xmin,ymax,xmax" (0-1000) a un BBox; devuelve null si es inválido.
+function parseBBox(raw: string): BBox | null {
+  if (!raw) return null;
+  const nums = raw.replace(/[\[\]()]/g, "").split(",").map((n) => parseInt(n.trim(), 10));
+  if (nums.length < 4 || nums.some((n) => isNaN(n))) return null;
+  let [ymin, xmin, ymax, xmax] = nums;
+  // Asegura orden correcto
+  if (ymax < ymin) [ymin, ymax] = [ymax, ymin];
+  if (xmax < xmin) [xmin, xmax] = [xmax, xmin];
+  const clamp = (v: number) => Math.max(0, Math.min(1000, v));
+  return { ymin: clamp(ymin), xmin: clamp(xmin), ymax: clamp(ymax), xmax: clamp(xmax) };
+}
+
+// Busca y puntúa coincidencias en la lista maestra por DNI o nombre.
+function scoreMasterSearch(query: string, masterData: MasterRow[]): { master: MasterRow; score: number; matchType: string }[] {
+  const q = query.trim();
+  if (!q) return [];
+
+  const qNorm = normalizeText(q);
+  const qNormDni = normalizeDniStrict(q);
+  const qTokens = qNorm.split(/\s+/).filter((t: string) => t.length >= 2);
+
+  const scored: { master: MasterRow; score: number; matchType: string }[] = [];
+
+  for (const m of masterData) {
+    const nameNorm = normalizeText(m.nombre);
+    const dniNorm = normalizeDniStrict(m.dni);
+    const nameWords = nameNorm.split(/\s+/);
+
+    // --- DNI matches (highest priority) ---
+    // Busca desde 2 dígitos: exacto > prefijo > contiene.
+    if (qNormDni.length >= 2) {
+      if (dniNorm === qNormDni) { scored.push({ master: m, score: 2.0, matchType: 'dni_exact' }); continue; }
+      if (dniNorm.startsWith(qNormDni)) { scored.push({ master: m, score: 1.85 - (8 - qNormDni.length) * 0.04, matchType: 'dni_partial' }); continue; }
+      if (qNormDni.length >= 3 && dniNorm.includes(qNormDni)) { scored.push({ master: m, score: 1.3, matchType: 'dni_partial' }); continue; }
+    }
+
+    // --- Name matches ---
+    if (qTokens.length > 0) {
+      const allWordStart = qTokens.every((t: string) => nameWords.some((w: string) => w.startsWith(t)));
+      if (allWordStart) { scored.push({ master: m, score: 1.1 + (qTokens.length > 1 ? 0.15 : 0), matchType: 'name' }); continue; }
+      const allContain = qTokens.every((t: string) => nameNorm.includes(t));
+      if (allContain) { scored.push({ master: m, score: 0.85 + (qTokens.length > 1 ? 0.10 : 0), matchType: 'name' }); continue; }
+      if (qTokens.some((t: string) => t.length >= 3 && nameWords.some((w: string) => w.startsWith(t)))) { scored.push({ master: m, score: 0.60, matchType: 'name' }); continue; }
+      if (qTokens.some((t: string) => t.length >= 3 && nameNorm.includes(t))) { scored.push({ master: m, score: 0.40, matchType: 'name' }); continue; }
+    }
+
+    // Fuzzy fallback for longer queries
+    if (qNorm.length >= 5) {
+      const fuzzy = nameMatchScore(q, m.nombre);
+      if (fuzzy >= 0.62) scored.push({ master: m, score: fuzzy * 0.50, matchType: 'fuzzy' });
+    }
+  }
+
+  return scored.sort((a, b) => b.score - a.score).slice(0, 15);
+}
+
+export default function App() {
+  const [sending, setSending] = useState(false);
+  // Aviso propio en vez de alert(): los diálogos nativos los suprimen bastantes
+  // navegadores (sobre todo en móvil), y cuando eso pasa la acción se completa o falla
+  // sin que el usuario vea absolutamente nada y parezca que el botón está roto.
+  const [toast, setToast] = useState<{ tipo: "ok" | "error"; msg: string } | null>(null);
+  const toastTimer = useRef<number | null>(null);
+  const mostrarToast = useCallback((tipo: "ok" | "error", msg: string) => {
+    if (toastTimer.current) window.clearTimeout(toastTimer.current);
+    setToast({ tipo, msg });
+    toastTimer.current = window.setTimeout(() => setToast(null), tipo === "error" ? 7000 : 3500);
+  }, []);
+
+  // Mismo motivo que el toast: prompt() es un diálogo nativo y puede no aparecer nunca,
+  // dejando el envío a Sheets muerto en silencio. Se pide el IdRef dentro de la app.
+  const [sheetsModal, setSheetsModal] = useState(false);
+  const [idRefInput, setIdRefInput] = useState("");
+
+    // Enviar datos a Google Sheets
+    const handleSendToSheets = async (IdRef: string) => {
+      if (!IdRef.trim()) {
+        mostrarToast("error", "Debe ingresar un IdRef para continuar.");
+        return;
+      }
+      setSheetsModal(false);
+      setSending(true);
+      try {
+        const participantes = displayedData
+          .filter((row: ExtractedRow) => !!getMasterInfo(row.dni))
+          .map((row: ExtractedRow) => {
+            const master = getMasterInfo(row.dni)!;
+            const uniqueId = "x" + Math.random().toString(36).substring(2, 8).toUpperCase();
+            return {
+              Id: uniqueId,
+              ParticipanteDNI: master.dni.toUpperCase(),
+              Participante: master.nombre.toUpperCase(),
+              Cargo: master.cargo.toUpperCase(),
+              Area: master.area.toUpperCase()
+            };
+          });
+
+        if (participantes.length === 0) {
+          mostrarToast("error", "No hay participantes con coincidencias válidas para enviar.");
+          setSending(false);
+          return;
+        }
+        const response = await fetch(GOOGLE_SHEETS_WEBAPP_URL, {
+          method: "POST",
+          headers: { "Content-Type": "text/plain;charset=utf-8" },
+          body: JSON.stringify({ IdRef, participantes })
+        });
+        // Apps Script devuelve HTML (no JSON) cuando el despliegue caduca o pide login;
+        // response.json() reventaría con un error de parseo que no explica nada.
+        const raw = await response.text();
+        let result: any;
+        try {
+          result = JSON.parse(raw);
+        } catch {
+          throw new Error(
+            `El servidor no devolvió JSON (HTTP ${response.status}). Puede que el despliegue de Apps Script haya caducado o exija iniciar sesión.`
+          );
+        }
+        if (result.success) {
+          mostrarToast("ok", `${participantes.length} participante(s) enviado(s) a Google Sheets.`);
+        } else {
+          mostrarToast("error", "Error al enviar: " + (result.message || "respuesta sin detalle."));
+        }
+      } catch (err: unknown) {
+        mostrarToast("error", err instanceof Error ? `Error de red o servidor: ${err.message}` : "Error de red o servidor desconocido");
+      }
+      setSending(false);
+    };
+  const [files, setFiles] = useState<DocumentFile[]>([]);
+  const [status, setStatus] = useState<"idle" | "processing" | "success" | "error">("idle");
+  const [extractedData, setExtractedData] = useState<ExtractedRow[]>([]);
+  const [masterData, setMasterData] = useState<MasterRow[]>([]);
+  const [masterStatus, setMasterStatus] = useState<"cargando" | "ok" | "error">("cargando");
+  const [modelUsed, setModelUsed] = useState<string>("");
+  const [relecturaBusy, setRelecturaBusy] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string>("");
+  const [isApiKeyMissing, setIsApiKeyMissing] = useState<boolean>(false);
+  
+  useEffect(() => {
+    // Check for API key on mount
+    const key = (import.meta as any).env?.VITE_GEMINI_API_KEY;
+    if (!key) {
+      setIsApiKeyMissing(true);
+      setErrorMessage("ADVERTENCIA: Falta la variable de entorno VITE_GEMINI_API_KEY. Configúrala en Vercel para que la extracción funcione.");
+    }
+  }, []);
+  
+  const [showSearch, setShowSearch] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [viewerQuery, setViewerQuery] = useState("");
+  const [copiedDni, setCopiedDni] = useState<string | null>(null);
+  
+  // Viewer state
+  const [viewingImage, setViewingImage] = useState<{ url: string, name: string, bbox: BBox | null, fila: string, pagina: string, totalPages: number, rowId: string | null } | null>(null);
+  const [zoomLevel, setZoomLevel] = useState(1);
+  const [panOffset, setPanOffset] = useState({ x: 0, y: 0 });
+  const [isPanning, setIsPanning] = useState(false);
+  const panStartRef = useRef({ x: 0, y: 0 });
+  const [bboxNudge, setBboxNudge] = useState(0); // corrección manual ±filas para la marca
+  const [viewerDropdownOpen, setViewerDropdownOpen] = useState(false); // navegador de registros FUERA en el visor
+  const [viewerError, setViewerError] = useState<string | null>(null); // aviso cuando no se puede abrir el documento
+
+  const [tableFilter, setTableFilter] = useState("");
+  const [sortConfig, setSortConfig] = useState<{ key: string, direction: 'asc' | 'desc' } | null>(null);
+  const [activeFilters, setActiveFilters] = useState<{ [key: string]: string[] }>({});
+  const [openFilterMenu, setOpenFilterMenu] = useState<string | null>(null);
+  
+  // Avance de la carga de documentos (leer → rasterizar páginas → limpiar imagen).
+  const [uploadProgress, setUploadProgress] = useState<{
+    archivo: string; indice: number; total: number; pct: number; fase: string;
+  } | null>(null);
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  // Colapso de la barra lateral en escritorio (en móvil el panel ya se abre/cierra con isMobileMenuOpen).
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => {
+    try { return localStorage.getItem("sidebarCollapsed") === "1"; } catch { return false; }
+  });
+  const [showOnlyErrors, setShowOnlyErrors] = useState(false);
+  // Se guarda el id del registro, no su posición: la lista se filtra y se ordena en vivo.
+  const [activeCandidateRow, setActiveCandidateRow] = useState<string | null>(null);
+  const [editingRowId, setEditingRowId] = useState<string | null>(null);
+  const [colWidths, setColWidths] = useState<Record<string, number>>({
+    // El DNI son 8 dígitos en fuente monoespaciada: con 130 px la caja los recortaba
+    // y solo se veían 6, que parecían DNIs mal leídos sin serlo.
+    nro: 60, ver: 60, nombre: 200, dni: 170, estado: 80, method: 110, sourceFile: 130, filaDoc: 90, dniSheets: 130, nombreOficial: 220
+  });
+  const resizingRef = useRef<{ col: string; startX: number; startWidth: number } | null>(null);
+
+  useEffect(() => {
+    try { localStorage.setItem("sidebarCollapsed", isSidebarCollapsed ? "1" : "0"); } catch { /* modo privado */ }
+  }, [isSidebarCollapsed]);
+
+  // Sin lista maestra no hay contra qué cruzar y TODOS los registros salen FUERA. Antes
+  // el fallo solo se escribía en la consola, así que parecía que la app no reconocía a
+  // nadie cuando en realidad no tenía con quién comparar. Ahora se reintenta y se avisa.
+  const cargarMaestra = useCallback(async (intentos = 3) => {
+    setMasterStatus("cargando");
+    for (let i = 0; i < intentos; i++) {
+      try {
+        const response = await fetch(MASTER_DATA_URL);
+        if (!response.ok) throw new Error(`El servidor respondió ${response.status}`);
+        const text = await response.text();
+        const rows = text.split("\n").filter((r) => r.trim());
+        const parsed: MasterRow[] = rows.slice(1).map((row) => {
+          const cols = parseCSVRow(row);
+          return {
+            dni: cols[0] || "",
+            nombre: cols[5] || "",
+            cargo: cols[8] || "",
+            area: cols[9] || ""
+          };
+        }).filter((r) => r.dni);
+        if (parsed.length === 0) throw new Error("La lista maestra llegó vacía");
+        setMasterData(parsed);
+        setMasterStatus("ok");
+        return;
+      } catch (err) {
+        console.error(`Fallo al cargar la lista maestra (intento ${i + 1}/${intentos}):`, err);
+        if (i < intentos - 1) await new Promise((r) => setTimeout(r, 800 * (i + 1)));
+      }
+    }
+    setMasterStatus("error");
+  }, []);
+
+  useEffect(() => { cargarMaestra(); }, [cargarMaestra]);
+
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!resizingRef.current) return;
+      const { col, startX, startWidth } = resizingRef.current;
+      const diff = e.clientX - startX;
+      setColWidths(prev => ({ ...prev, [col]: Math.max(50, startWidth + diff) }));
+    };
+    const handleMouseUp = () => { resizingRef.current = null; };
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, []);
+
+  // El aviso del visor se descarta solo.
+  useEffect(() => {
+    if (!viewerError) return;
+    const t = setTimeout(() => setViewerError(null), 6000);
+    return () => clearTimeout(t);
+  }, [viewerError]);
+
+  const handleResizeStart = (col: string, clientX: number, currentWidth: number) => {
+    resizingRef.current = { col, startX: clientX, startWidth: currentWidth };
+  };
+
+  const getMasterInfo = (dni: string) => {
+    const normalized = normalizeDniStrict(dni);
+    if (!normalized) return undefined;
+    return masterData.find((m: MasterRow) => normalizeDniStrict(m.dni) === normalized);
+  };
+
+  const handleFilesAdded = async (newFiles: FileList | null) => {
+    if (!newFiles || newFiles.length === 0) return;
+    const validFiles = Array.from(newFiles).filter((f: File) => f.type.startsWith("image/") || f.type === "application/pdf");
+    if (validFiles.length === 0) return;
+    const newProcessedFiles: DocumentFile[] = [];
+
+    // Reparto del avance dentro de un documento: leerlo es rápido, rasterizar las
+    // páginas es lo más lento y limpiarlas va después.
+    const FIN_LECTURA = 8, FIN_RASTER = 55;
+    // Cede el hilo para que el navegador pinte la barra antes del siguiente paso pesado.
+    const repintar = () => new Promise((r) => setTimeout(r, 0));
+
+    for (let i = 0; i < validFiles.length; i++) {
+      const f = validFiles[i];
+      const avance = async (pct: number, fase: string) => {
+        setUploadProgress({ archivo: f.name, indice: i + 1, total: validFiles.length, pct: Math.round(pct), fase });
+        await repintar();
+      };
+      try {
+        await avance(0, "Leyendo archivo");
+        const base64Data = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve((reader.result as string).split(",")[1]);
+          reader.onerror = reject;
+          reader.readAsDataURL(f);
+        });
+        let pages: string[] = [];
+        let previewUrl: string | null = null;
+        await avance(FIN_LECTURA, "Preparando documento");
+
+        if (f.type.startsWith("image/")) {
+          const dataUrl = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = reject;
+            reader.readAsDataURL(f);
+          });
+          pages = [dataUrl];
+          previewUrl = dataUrl;
+          await avance(FIN_RASTER, "Imagen lista");
+        } else if (f.type === "application/pdf") {
+          try {
+            pages = await renderPdfToImages(base64Data, 2600, (hechas, total) => {
+              const pct = FIN_LECTURA + ((FIN_RASTER - FIN_LECTURA) * hechas) / Math.max(1, total);
+              setUploadProgress({
+                archivo: f.name, indice: i + 1, total: validFiles.length,
+                pct: Math.round(pct), fase: `Procesando página ${Math.min(hechas + 1, total)} de ${total}`,
+              });
+            });
+            previewUrl = pages[0] || null;
+          } catch (err) {
+            console.error("No se pudo renderizar el PDF:", f.name, err);
+          }
+        }
+
+        // Limpieza de sombras y contraste antes de mandarlo al OCR (visión clásica).
+        // En serie y no en paralelo: así el avance es real y no se dispara la memoria
+        // con un PDF de muchas hojas.
+        const ocrPages: { base64: string; mimeType: string }[] = [];
+        for (let p = 0; p < pages.length; p++) {
+          const pct = FIN_RASTER + ((100 - FIN_RASTER) * p) / Math.max(1, pages.length);
+          await avance(pct, pages.length > 1 ? `Mejorando imagen ${p + 1} de ${pages.length}` : "Mejorando imagen");
+          const prep = await enhanceForOcr(pages[p]);
+          ocrPages.push({ base64: prep.base64, mimeType: prep.mimeType });
+        }
+        await avance(100, "Listo");
+
+        newProcessedFiles.push({
+          id: Math.random().toString(36).substring(7),
+          name: f.name, size: f.size, mimeType: f.type, base64: base64Data, previewUrl, pages, ocrPages
+        });
+      } catch (err) { console.error("Error processing file:", f.name, err); }
+    }
+    setUploadProgress(null);
+    if (newProcessedFiles.length > 0) {
+      setFiles((prev: DocumentFile[]) => [...prev, ...newProcessedFiles]);
+      setStatus("idle");
+    }
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const executeExtraction = async () => {
+    if (files.length === 0) return;
+    setStatus("processing");
+    setErrorMessage("");
+    setExtractedData([]);
+    try {
+      // Se envían las páginas ya limpiadas. Etiquetar cada una con su número de página
+      // además reduce que el modelo se invente el origen de cada fila.
+      const inputFormats = files.flatMap((f) => {
+        if (!f.ocrPages || f.ocrPages.length === 0) {
+          return [{ data: f.base64, mimeType: f.mimeType, name: f.name }]; // por si el preprocesado falló
+        }
+        if (f.ocrPages.length === 1) {
+          return [{ data: f.ocrPages[0].base64, mimeType: f.ocrPages[0].mimeType, name: f.name }];
+        }
+        return f.ocrPages.map((p, i) => ({
+          data: p.base64, mimeType: p.mimeType, name: `${f.name} (página ${i + 1})`,
+        }));
+      });
+      const result = await processDocuments(inputFormats);
+      const rows = result.csv.split('\n').slice(1);
+
+      // Paso 1: parseo crudo (guardando la geometría de tabla y total de filas reportados).
+      type RawRow = ExtractedRow & { _tableBox: BBox | null; _totalFilas: number };
+      const rawRows: RawRow[] = rows.map((row: string, rowIndex: number) => {
+        const cols = row.split(';');
+        return {
+          id: `r${rowIndex}_${Date.now()}`,
+          nro: cols[0] || "", nombre: cols[1] || "", dni: cols[2] || "",
+          ocupacion: cols[3] || "", area: cols[4] || "", sourceFile: cols[5]?.trim() || "",
+          filaDoc: cols[6]?.trim() || "",
+          pagina: cols[7]?.trim() || "1",
+          bbox: null,
+          rowTotal: 0,
+          method: "DEFAULT" as MatchMethod,
+          _tableBox: parseBBox(cols[8]?.trim() || ""),
+          _totalFilas: parseInt(cols[9]?.trim() || "", 10),
+        };
+      }).filter((r: RawRow) => r.nombre || r.dni);
+
+      // Paso 2: consenso de geometría por (archivo + página) para anular el ruido de la IA.
+      const median = (arr: number[]) => {
+        if (arr.length === 0) return NaN;
+        const s = [...arr].sort((a, b) => a - b);
+        const mid = Math.floor(s.length / 2);
+        return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+      };
+      const groups: Record<string, RawRow[]> = {};
+      rawRows.forEach((r) => {
+        const key = `${r.sourceFile.toLowerCase()}||${r.pagina}`;
+        (groups[key] ||= []).push(r);
+      });
+      const consensus: Record<string, { box: BBox | null; total: number }> = {};
+      Object.keys(groups).forEach((key) => {
+        const arr = groups[key];
+        const boxes = arr.map((a) => a._tableBox).filter((b): b is BBox => !!b);
+        const totals = arr.map((a) => a._totalFilas).filter((n) => !isNaN(n) && n > 0);
+        // El total no puede ser menor que la fila física más alta detectada.
+        const maxFila = Math.max(0, ...arr.map((a) => parseInt(a.filaDoc, 10)).filter((n) => !isNaN(n)));
+        const box: BBox | null = boxes.length
+          ? {
+              ymin: Math.round(median(boxes.map((b) => b.ymin))),
+              xmin: Math.round(median(boxes.map((b) => b.xmin))),
+              ymax: Math.round(median(boxes.map((b) => b.ymax))),
+              xmax: Math.round(median(boxes.map((b) => b.xmax))),
+            }
+          : null;
+        const total = Math.max(Math.round(median(totals)) || 0, maxFila);
+        consensus[key] = { box, total };
+      });
+
+      // Paso 3: interpolación por CENTROS. box.ymin = centro del primer renglón,
+      // box.ymax = centro del último renglón (renglón nº total). Cada fila se ubica
+      // proporcionalmente entre ambos centros según su número FilaDoc.
+      const clampN = (v: number) => Math.max(0, Math.min(1000, v));
+      const parsed: ExtractedRow[] = rawRows.map((r) => {
+        const key = `${r.sourceFile.toLowerCase()}||${r.pagina}`;
+        const c = consensus[key];
+        const fila = parseInt(r.filaDoc, 10);
+        let bbox: BBox | null = null;
+        if (c && c.box && c.total >= 1 && !isNaN(fila) && fila >= 1) {
+          const y1 = c.box.ymin; // centro del primer renglón
+          const yN = c.box.ymax; // centro del último renglón
+          const N = c.total;
+          const rowH = N > 1 ? (yN - y1) / (N - 1) : Math.max(yN - y1, 25);
+          const center = y1 + (fila - 1) * rowH;
+          bbox = {
+            xmin: c.box.xmin,
+            xmax: c.box.xmax,
+            ymin: clampN(Math.round(center - rowH / 2)),
+            ymax: clampN(Math.round(center + rowH / 2)),
+          };
+        }
+        const { _tableBox, _totalFilas, ...clean } = r;
+        return { ...clean, bbox, rowTotal: c?.total || 0 };
+      });
+      // La vinculación local se aplica sola: no tiene coste (es algoritmo, no IA) y
+      // dejarla detrás de un botón hacía que el panel se abriera con todo en FUERA
+      // aunque los registros fueran perfectamente identificables.
+      const { updated } = masterData.length > 0 ? vincularRegistros(parsed) : { updated: parsed };
+      setExtractedData(updated);
+      setModelUsed(result.modelUsed);
+      setStatus("success");
+    } catch (err: any) {
+      console.error("Extraction failed:", err);
+      setStatus("error");
+      setErrorMessage(err.message || "Error en el procesamiento.");
+    }
+  };
+
+  // Vinculación local (sin IA) en una sola pasada: por cada registro se puntúan a la vez
+  // el DNI y el nombre contra toda la maestra y se fusionan ambas señales. Dos indicios
+  // medios que apuntan a la misma persona valen más que uno solo, así que casos que antes
+  // se quedaban FUERA (DNI con 2 dígitos mal + nombre a medio leer) ahora se resuelven.
+  const UMBRAL_AUTO = 0.78;      // aplica el match sin preguntar
+  const UMBRAL_SUGERENCIA = 0.60; // por debajo no se ofrece nada
+  const MARGEN_MINIMO = 0.05;    // ventaja exigida al 1º sobre el 2º para aplicar solo
+
+  // Núcleo de la vinculación, sin tocar estado ni avisar: así puede usarse tanto desde
+  // el botón como automáticamente al terminar una extracción.
+  const vincularRegistros = (rows: ExtractedRow[]) => {
+    let matchesFound = 0;
+    let suggestionsFound = 0;
+    let ambiguas = 0;
+
+    const updated = rows.map((row: ExtractedRow) => {
+      if (getMasterInfo(row.dni)) return row;              // ya está resuelto
+      const usaDni = !!row.dni && row.dni.length >= 6;
+      const usaNombre = !!row.nombre && row.nombre.length >= 4;
+      if (!usaDni && !usaNombre) return row;
+
+      const candidates = masterData
+        .map((m: MasterRow) => ({
+          master: m,
+          score: combinedMatchScore(
+            usaDni ? dniFuzzyScore(row.dni, m.dni) : 0,
+            usaNombre ? nameMatchScore(row.nombre, m.nombre) : 0
+          ),
+        }))
+        .filter((c) => c.score >= UMBRAL_SUGERENCIA)
+        .sort((a, b) => b.score - a.score);
+
+      if (candidates.length === 0) return row;
+      const top3 = candidates.slice(0, 3);
+      const best = top3[0];
+      // Si el segundo candidato está pegado al primero, la elección no está clara:
+      // se deja como sugerencia para que decida una persona en vez de arriesgar.
+      const margenSuficiente = top3.length < 2 || best.score - top3[1].score >= MARGEN_MINIMO;
+
+      if (best.score >= UMBRAL_AUTO && margenSuficiente) {
+        matchesFound++;
+        return { ...row, dni: best.master.dni, method: "IA" as MatchMethod, matchConfidence: best.score, matchCandidates: top3 };
+      }
+      if (best.score >= UMBRAL_AUTO) ambiguas++;
+      suggestionsFound++;
+      return { ...row, matchCandidates: top3 };
+    });
+
+    return { updated, matchesFound, suggestionsFound, ambiguas };
+  };
+
+  const tryFuzzyMatch = () => {
+    const { updated, matchesFound, suggestionsFound, ambiguas } = vincularRegistros(extractedData);
+    setExtractedData(updated);
+    if (matchesFound > 0 || suggestionsFound > 0) {
+      const parts = [];
+      if (matchesFound > 0) parts.push(`${matchesFound} coincidencias aplicadas`);
+      if (suggestionsFound > 0) parts.push(`${suggestionsFound} sugerencias para revisar`);
+      if (ambiguas > 0) parts.push(`${ambiguas} con dos candidatos casi iguales`);
+      alert(parts.join(" · ") + ".");
+    } else {
+      alert("No se encontraron nuevas coincidencias.");
+    }
+  };
+
+  const acceptAllHighConfidence = () => {
+    const updated = extractedData.map((row: ExtractedRow) => {
+      if (row.method === "IA" && row.matchConfidence != null && row.matchConfidence >= 0.92 && !getMasterInfo(row.dni)) {
+        return { ...row, method: "MANUAL" as MatchMethod };
+      }
+      return row;
+    });
+    setExtractedData(updated);
+  };
+
+  // --- Relectura puntual: el ÚLTIMO recurso, y el único gasto extra de IA -------------
+  //
+  // Solo entran aquí las filas que el matching local no logró resolver. La idea es la
+  // misma que tiene una persona cuando no distingue un 4 de un 9: acercar la lupa. Se
+  // recorta ese renglón y se manda solo, así recibe para él todo el presupuesto de
+  // tokens que antes se repartía entre las 20 filas de la hoja.
+  //
+  // Tope duro: si la maestra no cargó, TODAS las filas salen sin coincidencia y sin este
+  // límite se dispararía una relectura del documento entero, que es justo lo contrario
+  // de lo que se busca.
+  const MAX_RELECTURA = 12;
+
+  const filasSinCoincidencia = useMemo(
+    () => extractedData.filter((r: ExtractedRow) => !getMasterInfo(r.dni) && !!r.bbox),
+    [extractedData, masterData]
+  );
+
+  // Por debajo de este tamaño se manda la maestra COMPLETA. Prefiltrar tiene un riesgo
+  // que no compensa: si el OCR leyó muy mal, la persona correcta se queda fuera del
+  // conjunto candidato y la relectura ya no puede acertar. Con ~700 personas la lista
+  // entera son unos 10k tokens de entrada en una única llamada, así que no hay motivo
+  // para arriesgarse. El prefiltro queda para maestras grandes, donde sí haría falta.
+  const MAX_MAESTRA_COMPLETA = 1200;
+
+  // Convierte "leer 8 dígitos cualesquiera" en "elegir dentro de una lista conocida",
+  // que es un problema mucho más fácil: un 4 que parece un 9 se resuelve solo si
+  // únicamente una de las dos opciones existe en la lista.
+  const construirCandidatos = (filas: ExtractedRow[]) => {
+    if (masterData.length <= MAX_MAESTRA_COMPLETA) {
+      return masterData.map((m: MasterRow) => ({ dni: m.dni, nombre: m.nombre }));
+    }
+    const vistos = new Set<string>();
+    const out: { dni: string; nombre: string }[] = [];
+    filas.forEach((row: ExtractedRow) => {
+      const usaDni = !!row.dni && row.dni.length >= 4;
+      const usaNombre = !!row.nombre && row.nombre.length >= 3;
+      if (!usaDni && !usaNombre) return;
+      masterData
+        .map((m: MasterRow) => ({
+          m,
+          s: combinedMatchScore(
+            usaDni ? dniFuzzyScore(row.dni, m.dni) : 0,
+            usaNombre ? nameMatchScore(row.nombre, m.nombre) : 0
+          ),
+        }))
+        .sort((a, b) => b.s - a.s)
+        .slice(0, 25)
+        .forEach(({ m }) => {
+          if (vistos.has(m.dni)) return;
+          vistos.add(m.dni);
+          out.push({ dni: m.dni, nombre: m.nombre });
+        });
+    });
+    return out.slice(0, 300);
+  };
+
+  const handleRelectura = async () => {
+    const objetivo = filasSinCoincidencia.slice(0, MAX_RELECTURA);
+    if (objetivo.length === 0) return;
+    setRelecturaBusy(true);
+    try {
+      // Agrupadas por página: cada recorte necesita la imagen de la que sale.
+      const porPagina = new Map<string, ExtractedRow[]>();
+      objetivo.forEach((r: ExtractedRow) => {
+        const key = `${r.sourceFile.toLowerCase()}||${r.pagina}`;
+        porPagina.set(key, [...(porPagina.get(key) || []), r]);
+      });
+
+      const recortes: RecorteFila[] = [];
+      for (const filas of porPagina.values()) {
+        const file = findSourceFile(filas[0].sourceFile);
+        if (!file) continue;
+        const pages = pagesOf(file);
+        const url = pages[resolvePageIdx(file, filas[0].sourceFile, filas[0].pagina)];
+        if (!url) continue;
+        recortes.push(
+          ...(await recortarFilas(url, filas.map((f) => ({ id: f.id, bbox: f.bbox! }))))
+        );
+      }
+
+      if (recortes.length === 0) {
+        alert("No se pudo recortar ningún renglón: falta la ubicación exacta de esas filas.");
+        return;
+      }
+
+      const { lecturas } = await releerFilas(recortes, construirCandidatos(objetivo));
+      const porId = new Map(lecturas.map((l) => [l.id, l]));
+
+      const conLecturas = extractedData.map((row: ExtractedRow) => {
+        const l = porId.get(row.id);
+        if (!l) return row;
+        const nuevoDni = (l.dni || "").replace(/\D/g, "");
+        const nombre = l.nombre?.trim() || row.nombre;
+        // Si la relectura cae sobre alguien de la maestra, es una resolución limpia.
+        if (nuevoDni && getMasterInfo(nuevoDni)) {
+          return { ...row, dni: nuevoDni, nombre, method: "IA" as MatchMethod, matchConfidence: l.confianza };
+        }
+        // Si no, se conserva lo leído para que el matching local lo reintente: un DNI
+        // mejor leído puede cruzar el umbral aunque por sí solo no esté en la lista.
+        return { ...row, nombre, dni: nuevoDni || row.dni };
+      });
+
+      const { updated } = masterData.length > 0
+        ? vincularRegistros(conLecturas)
+        : { updated: conLecturas };
+      setExtractedData(updated);
+
+      const resueltas = updated.filter(
+        (r: ExtractedRow) => porId.has(r.id) && !!getMasterInfo(r.dni)
+      ).length;
+      alert(
+        `Relectura de ${recortes.length} renglón(es): ${resueltas} resuelto(s), ` +
+        `${recortes.length - resueltas} sigue(n) sin coincidencia.`
+      );
+    } catch (err: any) {
+      console.error("Relectura fallida:", err);
+      alert(`No se pudo releer: ${err.message || err}`);
+    } finally {
+      setRelecturaBusy(false);
+    }
+  };
+
+  const getCsvString = () => {
+    const header = "DNI;NOMBRE OFICIAL;OCUPACION;AREA;METODO;ORIGEN;FILA DOC";
+    const bodyRows = displayedData.map((row: ExtractedRow) => {
+      const master = getMasterInfo(row.dni);
+      if (!master) return null;
+      return `${row.dni.toUpperCase()};${master.nombre.toUpperCase()};${master.cargo.toUpperCase()};${master.area.toUpperCase()};${row.method};${row.sourceFile};${row.filaDoc}`;
+    }).filter((r: string | null) => r !== null);
+    return [header, ...bodyRows].join('\n');
+  };
+
+  // Quita solo la última extensión: "CamScanner 02-08 16.45.jpeg" → "camscanner 02-08 16.45".
+  const fileStem = (name: string) => name.toLowerCase().trim().replace(/\.[^.]+$/, "");
+
+  // La IA no siempre repite el nombre real del archivo en SourceFile: a veces inventa
+  // nombres sintéticos por página ("page 2.jpeg"). Cuando ese nombre no corresponde a
+  // ningún documento cargado, el número que trae suele ser la página real.
+  const pageHintFromName = (filename: string): number | null => {
+    const m = /(?:p[áa]g(?:ina)?|page|pag|hoja|img|image|scan)[\s._-]*(\d{1,3})/i.exec(filename || "");
+    const n = m ? parseInt(m[1], 10) : NaN;
+    return !isNaN(n) && n >= 1 ? n : null;
+  };
+
+  // Resuelve el documento de origen de una fila tolerando que SourceFile no coincida
+  // exactamente con el nombre del archivo cargado.
+  const findSourceFile = (filename: string): DocumentFile | undefined => {
+    if (files.length === 0) return undefined;
+    // Con un único documento cargado no hay ambigüedad posible: la fila sale de ese.
+    if (files.length === 1) return files[0];
+    if (!filename) return undefined;
+    const target = filename.toLowerCase().trim();
+    const targetStem = fileStem(filename);
+    return (
+      files.find((f: DocumentFile) => f.name.toLowerCase().trim() === target) ||
+      files.find((f: DocumentFile) => fileStem(f.name) === targetStem) ||
+      files.find((f: DocumentFile) => !!targetStem && (fileStem(f.name).includes(targetStem) || targetStem.includes(fileStem(f.name))))
+    );
+  };
+
+  // Páginas navegables del documento (un PDF que no se pudo rasterizar cae a su preview).
+  const pagesOf = (file: DocumentFile): string[] =>
+    file.pages && file.pages.length > 0 ? file.pages : file.previewUrl ? [file.previewUrl] : [];
+
+  // Índice (base 0) de la página donde vive la fila. Compartido por el visor y por la
+  // detección de renglones para que ambos apunten siempre a la misma imagen.
+  const resolvePageIdx = (file: DocumentFile, filename: string, pagina: string): number => {
+    const total = Math.max(1, pagesOf(file).length);
+    const hint = fileStem(file.name) === fileStem(filename || "") ? null : pageHintFromName(filename);
+    const paginaNum = parseInt(pagina || "1", 10) || 1;
+    const pageNum = hint && paginaNum <= 1 ? hint : paginaNum;
+    return Math.min(Math.max(0, pageNum - 1), total - 1);
+  };
+
+  const openViewer = (filename: string, pagina: string, bbox: BBox | null, fila: string, rowId: string | null) => {
+    const file = findSourceFile(filename);
+    // Nunca fallar en silencio: el botón "ojo" siempre debe responder algo.
+    if (!file) {
+      setViewerError(
+        files.length === 0
+          ? "No hay documentos cargados. Vuelve a subir el archivo para poder verlo."
+          : `No se pudo ubicar el documento de origen «${filename || "sin nombre"}» entre los archivos cargados.`
+      );
+      return;
+    }
+    const pages = pagesOf(file);
+    if (pages.length === 0) {
+      setViewerError(`«${file.name}» no se pudo convertir a imagen, así que no hay vista previa disponible.`);
+      return;
+    }
+    const safeIdx = resolvePageIdx(file, filename, pagina);
+    setViewingImage({ url: pages[safeIdx], name: file.name, bbox, fila, pagina: String(safeIdx + 1), totalPages: pages.length, rowId });
+    setZoomLevel(1); setPanOffset({ x: 0, y: 0 }); setBboxNudge(0);
+    setViewerError(null);
+  };
+
+  // Abre el documento marcando la fila exacta del registro, con panel de edición.
+  // Primero muestra la marca aproximada (IA) y luego la refina detectando el grid real.
+  const handleViewRow = async (row: ExtractedRow) => {
+    setViewerQuery(row.nombre || row.dni || "");
+    openViewer(row.sourceFile, row.pagina, row.bbox, row.filaDoc, row.id);
+
+    const fila = parseInt(row.filaDoc, 10);
+    if (isNaN(fila) || fila < 1) return;
+    const file = findSourceFile(row.sourceFile);
+    if (!file) return;
+    const pages = pagesOf(file);
+    if (pages.length === 0) return;
+    const pageIdx = resolvePageIdx(file, row.sourceFile, row.pagina);
+
+    const xMin = row.bbox ? row.bbox.xmin / 1000 : 0.03;
+    const xMax = row.bbox ? row.bbox.xmax / 1000 : 0.97;
+    const bands = await detectDataRowBands(pages[pageIdx], xMin, xMax, row.rowTotal);
+    if (!bands || !bands.length) return;
+
+    // La marca interpolada a partir de los anclajes de la IA ya da la posición
+    // aproximada de la fila; el grid detectado solo debe afinar sus bordes. Por eso se
+    // elige la banda cuyo centro cae más cerca de esa posición, en vez de contar bandas
+    // por índice: contar obligaba a acertar cuántas líneas hay antes y después de la
+    // tabla, y una sola de más (la cabecera del formulario, un pie, un renglón bajo la
+    // última fila) corría la cuenta entera y la marca aterrizaba en otra fila.
+    const alturaMedia = bands.reduce((s, b) => s + (b.bottom - b.top), 0) / bands.length;
+    let band: { top: number; bottom: number } | undefined;
+
+    if (row.bbox) {
+      const centroEsperado = (row.bbox.ymin + row.bbox.ymax) / 2000; // fracción 0-1
+      let mejorDist = Infinity;
+      for (const b of bands) {
+        const d = Math.abs((b.top + b.bottom) / 2 - centroEsperado);
+        if (d < mejorDist) { mejorDist = d; band = b; }
+      }
+      // Si ni la banda más cercana queda a menos de una fila de distancia, el grid
+      // detectado no se corresponde con esta tabla: es preferible dejar la marca
+      // interpolada antes que moverla a un renglón equivocado.
+      if (mejorDist > alturaMedia * 1.2) return;
+    } else {
+      // Sin anclajes de la IA no hay referencia: se cuenta desde el inicio del grid.
+      band = bands[Math.min(Math.max(0, fila - 1), bands.length - 1)];
+    }
+    if (!band) return;
+
+    setViewingImage((prev) =>
+      prev && prev.rowId === row.id
+        ? {
+            ...prev,
+            bbox: {
+              xmin: row.bbox?.xmin ?? Math.round(xMin * 1000),
+              xmax: row.bbox?.xmax ?? Math.round(xMax * 1000),
+              ymin: Math.round(band.top * 1000),
+              ymax: Math.round(band.bottom * 1000),
+            },
+          }
+        : prev
+    );
+  };
+
+  // Apertura simple (doble clic en el archivo de la barra lateral): primera página, sin marca.
+  const handleViewSource = (filename: string) => {
+    setViewerQuery("");
+    openViewer(filename, "1", null, "", null);
+  };
+
+  // Advanced Viewer Handlers
+  const handlePanStart = (e: React.MouseEvent) => {
+    setIsPanning(true);
+    panStartRef.current = { x: e.clientX - panOffset.x, y: e.clientY - panOffset.y };
+  };
+  const handlePanMove = useCallback((e: React.MouseEvent) => {
+    if (!isPanning) return;
+    setPanOffset({ x: e.clientX - panStartRef.current.x, y: e.clientY - panStartRef.current.y });
+  }, [isPanning]);
+  const handlePanEnd = () => setIsPanning(false);
+
+  // Touch Gestures State
+  const touchStartDistRef = useRef<number | null>(null);
+  const touchStartZoomRef = useRef<number>(1);
+
+  const handleTouchStart = (e: React.TouchEvent) => {
+    if (e.touches.length === 1) {
+      setIsPanning(true);
+      panStartRef.current = { x: e.touches[0].clientX - panOffset.x, y: e.touches[0].clientY - panOffset.y };
+      touchStartDistRef.current = null;
+    } else if (e.touches.length === 2) {
+      setIsPanning(false);
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      touchStartDistRef.current = Math.hypot(dx, dy);
+      touchStartZoomRef.current = zoomLevel;
+    }
+  };
+  
+  const handleTouchMove = useCallback((e: React.TouchEvent) => {
+    if (e.touches.length === 1 && isPanning) {
+      setPanOffset({ x: e.touches[0].clientX - panStartRef.current.x, y: e.touches[0].clientY - panStartRef.current.y });
+    } else if (e.touches.length === 2 && touchStartDistRef.current !== null) {
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      const currentDist = Math.hypot(dx, dy);
+      const scale = currentDist / touchStartDistRef.current;
+      setZoomLevel(Math.min(Math.max(touchStartZoomRef.current * scale, 0.5), 15));
+    }
+  }, [isPanning, zoomLevel]);
+
+  const handleTouchEnd = () => {
+    setIsPanning(false);
+    touchStartDistRef.current = null;
+  };
+
+  const handleWheel = (e: React.WheelEvent) => {
+    if (e.ctrlKey || e.metaKey || true) { // Always allow wheel zoom for better UX
+      e.preventDefault();
+      const delta = -e.deltaY;
+      const factor = 1.1;
+      setZoomLevel(prev => {
+        const next = delta > 0 ? prev * factor : prev / factor;
+        return Math.min(Math.max(next, 0.5), 15);
+      });
+    }
+  };
+
+  const resetViewer = () => {
+    setZoomLevel(1);
+    setPanOffset({ x: 0, y: 0 });
+  };
+
+  const displayedData = useMemo(() => {
+    let result = [...extractedData];
+    
+    if (showOnlyErrors) {
+      result = result.filter((r: ExtractedRow) => !getMasterInfo(r.dni) || r.id === editingRowId);
+    }
+
+    if (tableFilter) {
+      const q = tableFilter.toLowerCase();
+      result = result.filter((r: ExtractedRow) => r.nombre.toLowerCase().includes(q) || r.dni.toLowerCase().includes(q) || r.sourceFile.toLowerCase().includes(q));
+    }
+    Object.keys(activeFilters).forEach((key: string) => {
+      const selectedValues = activeFilters[key];
+      if (selectedValues.length > 0) {
+        result = result.filter((r: ExtractedRow) => {
+          if (key === "estado") {
+            const master = getMasterInfo(r.dni);
+            return selectedValues.includes(!!master ? "OK" : "FUERA");
+          }
+          return selectedValues.includes(r[key as keyof ExtractedRow] as string);
+        });
+      }
+    });
+    if (sortConfig) {
+      result.sort((a: ExtractedRow, b: ExtractedRow) => {
+        let valA: string;
+        let valB: string;
+
+        if (sortConfig.key === "estado") {
+          valA = !!getMasterInfo(a.dni) ? "OK" : "FUERA";
+          valB = !!getMasterInfo(b.dni) ? "OK" : "FUERA";
+        } else {
+          valA = (a[sortConfig.key as keyof ExtractedRow] ?? "").toString().toLowerCase();
+          valB = (b[sortConfig.key as keyof ExtractedRow] ?? "").toString().toLowerCase();
+        }
+
+        if (valA < valB) return sortConfig.direction === 'asc' ? -1 : 1;
+        if (valA > valB) return sortConfig.direction === 'asc' ? 1 : -1;
+        return 0;
+      });
+    }
+    return result;
+  }, [extractedData, tableFilter, sortConfig, activeFilters, showOnlyErrors, masterData, editingRowId]);
+
+  const toggleSort = (key: string) => setSortConfig((prev: { key: string, direction: 'asc' | 'desc' } | null) => (prev?.key === key && prev.direction === 'asc') ? { key, direction: 'desc' } : { key, direction: 'asc' });
+  const toggleFilterValue = (column: string, value: string) => setActiveFilters((prev: { [key: string]: string[] }) => {
+    const current = prev[column] || [];
+    const updated = current.includes(value) ? current.filter((v: string) => v !== value) : [...current, value];
+    return { ...prev, [column]: updated };
+  });
+
+  const getUniqueValues = (column: string): string[] => {
+    if (column === "estado") return ["OK", "FUERA"];
+    const values = extractedData.map((r: ExtractedRow) => r[column as keyof ExtractedRow] as string);
+    return Array.from(new Set(values)).filter((v): v is string => !!v).sort();
+  };
+
+  const searchResults = useMemo(() => scoreMasterSearch(searchQuery, masterData), [searchQuery, masterData]);
+  const viewerResults = useMemo(() => scoreMasterSearch(viewerQuery, masterData), [viewerQuery, masterData]);
+
+  // Registro actualmente inspeccionado en el visor (para edición en vivo).
+  const viewingRow = useMemo(
+    () => (viewingImage?.rowId ? extractedData.find((r) => r.id === viewingImage.rowId) || null : null),
+    [viewingImage, extractedData]
+  );
+  const viewingRowMaster = viewingRow ? getMasterInfo(viewingRow.dni) : undefined;
+
+  // Cola de revisión del visor: los registros sin match, en el orden del documento.
+  // Se incluye el que se está viendo aunque ya lo hayas resuelto, para que no se salga
+  // de la lista bajo los pies al corregir su DNI y siga habiendo un "siguiente".
+  const viewerQueue = useMemo(
+    () => extractedData.filter((r) => !getMasterInfo(r.dni) || r.id === viewingImage?.rowId),
+    [extractedData, masterData, viewingImage?.rowId]
+  );
+  const viewerQueueIdx = viewingRow ? viewerQueue.findIndex((r) => r.id === viewingRow.id) : -1;
+  const goToQueue = (delta: number) => {
+    const next = viewerQueue[viewerQueueIdx + delta];
+    if (next) handleViewRow(next);
+  };
+
+  const applyDniToRow = (rowId: string, dni: string, method: MatchMethod = "MANUAL", confidence?: number) => {
+    setExtractedData((prev) => prev.map((r) => (r.id === rowId ? { ...r, dni, method, matchConfidence: confidence } : r)));
+  };
+
+  return (
+    <div className="flex h-screen w-full bg-slate-50 text-slate-800 font-sans overflow-hidden relative">
+      
+      {/* Backdrop para móviles */}
+      <AnimatePresence>
+        {isMobileMenuOpen && (
+          <motion.div 
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            onClick={() => setIsMobileMenuOpen(false)}
+            className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-40 md:hidden"
+          />
+        )}
+      </AnimatePresence>
+
+      <aside className={`fixed inset-y-0 left-0 z-50 transform ${isMobileMenuOpen ? 'translate-x-0' : '-translate-x-full'} md:relative md:translate-x-0 w-[300px] ${isSidebarCollapsed ? 'md:w-0 md:border-r-0 md:shadow-none' : 'md:w-[360px]'} flex-shrink-0 bg-white border-r border-slate-200 flex flex-col items-stretch overflow-hidden shadow-2xl md:shadow-xl transition-all duration-300 ease-in-out`}>
+        {/* Ancho fijo interior: evita que el contenido se comprima mientras el panel se colapsa. */}
+        <div className="w-[300px] md:w-[360px] h-full flex flex-col flex-shrink-0">
+        <div className="px-6 py-6 border-b border-slate-100 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-blue-100 text-blue-600 rounded-lg"><FileDigit size={24} /></div>
+            <div>
+              <h1 className="font-semibold text-lg leading-tight text-slate-900">{APP_NAME}</h1>
+              <p className="text-xs text-slate-500 font-medium tracking-wide uppercase">{APP_SUBTITLE}</p>
+            </div>
+          </div>
+          <button className="md:hidden p-2 text-slate-400 hover:text-slate-600 bg-slate-50 rounded-full" onClick={() => setIsMobileMenuOpen(false)}>
+            <X size={20} />
+          </button>
+          <button
+            className="hidden md:flex p-2 text-slate-400 hover:text-blue-600 hover:bg-blue-50 bg-slate-50 rounded-full transition-colors flex-shrink-0"
+            onClick={() => setIsSidebarCollapsed(true)}
+            title="Ocultar panel lateral"
+          >
+            <PanelLeftClose size={20} />
+          </button>
+        </div>
+        <div className="flex-1 overflow-y-auto p-6 scrollbar-hide">
+          <div className="w-full border-2 border-dashed border-slate-300 rounded-2xl bg-slate-50/50 hover:bg-blue-50/50 hover:border-blue-400 transition-colors cursor-pointer group flex flex-col items-center justify-center p-8 mb-6" onClick={() => fileInputRef.current?.click()}>
+            <div className="bg-white p-3 rounded-full shadow-sm text-slate-400 group-hover:text-blue-500 mb-3 transition-colors"><Upload size={24} /></div>
+            <p className="text-sm font-medium text-slate-700 mb-1 text-center">Añadir documentos</p>
+            <input type="file" multiple accept="image/*,application/pdf" className="hidden" ref={fileInputRef} onChange={(e) => handleFilesAdded(e.target.files)} />
+          </div>
+          <AnimatePresence>
+            {uploadProgress && (
+              <motion.div
+                initial={{ opacity: 0, y: -8, height: 0 }}
+                animate={{ opacity: 1, y: 0, height: "auto" }}
+                exit={{ opacity: 0, y: -8, height: 0 }}
+                className="mb-4 overflow-hidden"
+              >
+                <div className="p-4 rounded-2xl border border-blue-200 bg-blue-50/70">
+                  <div className="flex items-center justify-between gap-2 mb-1">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <Loader2 size={14} className="text-blue-600 animate-spin shrink-0" />
+                      <p className="text-xs font-semibold text-slate-800 truncate">{uploadProgress.archivo}</p>
+                    </div>
+                    <span className="text-sm font-black text-blue-600 tabular-nums shrink-0">{uploadProgress.pct}%</span>
+                  </div>
+
+                  <div className="w-full h-2 bg-blue-100 rounded-full overflow-hidden mt-2">
+                    <motion.div
+                      className="h-full bg-blue-600 rounded-full"
+                      animate={{ width: `${uploadProgress.pct}%` }}
+                      transition={{ ease: "easeOut", duration: 0.25 }}
+                    />
+                  </div>
+
+                  <div className="flex items-center justify-between gap-2 mt-1.5">
+                    <p className="text-[10px] text-slate-500 truncate">{uploadProgress.fase}</p>
+                    {uploadProgress.total > 1 && (
+                      <p className="text-[10px] font-bold text-slate-400 shrink-0">
+                        {uploadProgress.indice}/{uploadProgress.total} archivos
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          <div className="space-y-3">
+            {files.map((f) => (
+              <div key={f.id} onDoubleClick={() => handleViewSource(f.name)} className="group relative flex items-center p-3 rounded-xl border border-slate-200 bg-white shadow-sm hover:shadow-md transition-shadow cursor-pointer select-none">
+                <div className="h-10 w-10 flex-shrink-0 bg-slate-100 rounded-lg flex items-center justify-center overflow-hidden border border-slate-200 text-slate-500">
+                  {f.previewUrl ? <img src={f.previewUrl} alt="" className="object-cover w-full h-full" /> : <FileText size={20} />}
+                </div>
+                <div className="ml-3 flex-1 min-w-0 pr-8">
+                  <p className="text-sm font-medium text-slate-800 truncate">{f.name}</p>
+                </div>
+                <button onClick={(e) => { e.stopPropagation(); setFiles(prev => prev.filter(x => x.id !== f.id)); }} className="absolute right-3 p-2 rounded-full text-slate-400 hover:text-red-500 hover:bg-red-50 opacity-0 group-hover:opacity-100 transition-all"><X size={16} /></button>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="p-6 border-t border-slate-200 bg-white">
+          {isApiKeyMissing && (
+            <div className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-2 text-amber-700">
+              <AlertCircle size={16} className="flex-shrink-0 mt-0.5" />
+              <p className="text-[10px] font-medium leading-tight">Configura VITE_GEMINI_API_KEY en Vercel</p>
+            </div>
+          )}
+
+          {/* Estado de la lista maestra: si no cargó, todo saldría FUERA sin explicación */}
+          {masterStatus === "error" ? (
+            <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-xl flex items-start gap-2 text-red-700">
+              <AlertCircle size={16} className="flex-shrink-0 mt-0.5" />
+              <div className="min-w-0">
+                <p className="text-[11px] font-bold leading-tight">No se pudo cargar la lista maestra</p>
+                <p className="text-[10px] leading-snug mt-0.5 opacity-90">Sin ella no hay con quién comparar y todos los registros saldrán FUERA.</p>
+                <button onClick={() => cargarMaestra()} className="mt-2 text-[10px] font-bold uppercase tracking-wider bg-red-600 text-white px-2.5 py-1 rounded-lg hover:bg-red-700 transition-colors">
+                  Reintentar
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="mb-4 flex items-center gap-2 text-[10px] font-medium text-slate-500">
+              {masterStatus === "cargando" ? (
+                <><Loader2 size={12} className="animate-spin text-blue-500 shrink-0" /> Cargando lista maestra…</>
+              ) : (
+                <><CheckCircle2 size={12} className="text-emerald-500 shrink-0" /> Lista maestra: {masterData.length} personas</>
+              )}
+            </div>
+          )}
+          {/* Se bloquea mientras se cargan documentos: aún no están en `files` y se
+              extraería con la lista incompleta. */}
+          <button disabled={files.length === 0 || status === "processing" || isApiKeyMissing || !!uploadProgress} onClick={executeExtraction} className="w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-200 disabled:text-slate-400 text-white shadow-sm font-semibold rounded-xl py-3.5 transition-all text-sm">
+            {status === "processing" || uploadProgress ? <Loader2 size={18} className="animate-spin" /> : <Play size={18} fill="currentColor" />}
+            {uploadProgress ? "Cargando documentos…" : "Iniciar Extracción"}
+          </button>
+        </div>
+        </div>
+      </aside>
+
+      <main className="flex-1 overflow-hidden flex flex-col bg-[#FAFAFA] w-full">
+        {/* Cabecera Móvil */}
+        <div className="md:hidden bg-white border-b border-slate-200 px-4 py-3 flex items-center justify-between shadow-sm z-30 shrink-0">
+          <div className="flex items-center gap-3">
+            <button onClick={() => setIsMobileMenuOpen(true)} className="p-2 -ml-2 text-slate-600 bg-slate-50 rounded-lg">
+              <Menu size={24} />
+            </button>
+            <div className="flex items-center gap-2">
+              <FileDigit size={20} className="text-blue-600" />
+              <h1 className="font-bold text-slate-800">{APP_NAME}</h1>
+            </div>
+          </div>
+        </div>
+
+        <header className="flex-shrink-0 bg-white border-b border-slate-200 px-4 md:px-8 py-4 flex flex-col lg:flex-row items-start lg:items-center justify-between shadow-sm z-10 gap-4">
+          <div className="flex items-center gap-4 w-full lg:w-auto justify-between">
+            <h2 className="text-lg font-semibold text-slate-800 hidden md:flex items-center gap-3">
+              {isSidebarCollapsed && (
+                <button
+                  onClick={() => setIsSidebarCollapsed(false)}
+                  title="Mostrar panel lateral"
+                  className="p-2 -ml-2 text-slate-500 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors flex-shrink-0"
+                >
+                  <PanelLeftOpen size={20} />
+                </button>
+              )}
+              Panel de Resultados
+              {extractedData.length > 0 && (
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-bold bg-slate-100 text-slate-600 px-2.5 py-1 rounded-full">Total: {extractedData.length}</span>
+                  {extractedData.filter(r => !getMasterInfo(r.dni)).length > 0 && (
+                    <button
+                      onClick={() => setShowOnlyErrors(!showOnlyErrors)}
+                      className={`text-xs font-bold px-2.5 py-1 rounded-full border transition-colors ${showOnlyErrors ? 'bg-red-600 text-white border-red-700' : 'bg-red-100 text-red-600 border-red-200 hover:bg-red-200'}`}
+                    >
+                      ⚠️ Sin Match: {extractedData.filter(r => !getMasterInfo(r.dni)).length}
+                    </button>
+                  )}
+                  {extractedData.filter(r => !getMasterInfo(r.dni) && r.matchCandidates && r.matchCandidates.length > 0).length > 0 && (
+                    <span className="text-xs font-bold bg-amber-100 text-amber-700 px-2.5 py-1 rounded-full border border-amber-200">
+                      💡 Sugerencias: {extractedData.filter(r => !getMasterInfo(r.dni) && r.matchCandidates && r.matchCandidates.length > 0).length}
+                    </span>
+                  )}
+                </div>
+              )}
+            </h2>
+            <div className="md:hidden flex items-center gap-2">
+              <span className="font-semibold text-slate-700 text-sm">Resultados</span>
+              {extractedData.length > 0 && (
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[10px] font-bold bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full">{extractedData.length}</span>
+                  {extractedData.filter(r => !getMasterInfo(r.dni)).length > 0 && (
+                    <button 
+                      onClick={() => setShowOnlyErrors(!showOnlyErrors)}
+                      className={`text-[10px] font-bold px-2 py-0.5 rounded-full border transition-colors ${showOnlyErrors ? 'bg-red-600 text-white border-red-700' : 'bg-red-100 text-red-600 border-red-200'}`}
+                    >
+                      {extractedData.filter(r => !getMasterInfo(r.dni)).length} ⚠️
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+            {extractedData.length > 0 && (
+              <div className="flex items-center gap-2">
+                <button onClick={tryFuzzyMatch} className="flex items-center gap-2 px-3 md:px-4 py-2 text-[10px] md:text-xs font-bold text-white bg-gradient-to-r from-blue-600 to-indigo-600 rounded-full hover:from-blue-700 hover:to-indigo-700 transition-all shadow-md active:scale-95 whitespace-nowrap">
+                  <Sparkles size={14} /> <span className="hidden md:inline">Vincular por Nombre (IA)</span><span className="md:hidden">IA Link</span>
+                </button>
+                {extractedData.some(r => r.method === "IA" && r.matchConfidence != null && r.matchConfidence >= 0.92) && (
+                  <button onClick={acceptAllHighConfidence} className="flex items-center gap-1.5 px-3 py-2 text-[10px] md:text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-full transition-all shadow-md active:scale-95 whitespace-nowrap">
+                    <Check size={14} /> <span className="hidden md:inline">Aceptar Alta Confianza</span><span className="md:hidden">✓ AC</span>
+                  </button>
+                )}
+                {/* Último recurso: solo aparece si quedan filas sin resolver, y dice
+                    cuántas va a releer para que el gasto de IA sea siempre explícito. */}
+                {filasSinCoincidencia.length > 0 && (
+                  <button
+                    onClick={handleRelectura}
+                    disabled={relecturaBusy}
+                    title={`Recorta y amplía ${Math.min(filasSinCoincidencia.length, MAX_RELECTURA)} renglón(es) sin coincidencia y los relee de uno en uno`}
+                    className="flex items-center gap-1.5 px-3 py-2 text-[10px] md:text-xs font-bold text-white bg-amber-600 hover:bg-amber-700 disabled:opacity-60 disabled:cursor-not-allowed rounded-full transition-all shadow-md active:scale-95 whitespace-nowrap"
+                  >
+                    {relecturaBusy
+                      ? <Loader2 size={14} className="animate-spin" />
+                      : <ZoomIn size={14} />}
+                    <span className="hidden md:inline">
+                      {relecturaBusy ? "Releyendo…" : `Releer ${Math.min(filasSinCoincidencia.length, MAX_RELECTURA)} sin coincidencia`}
+                    </span>
+                    <span className="md:hidden">{Math.min(filasSinCoincidencia.length, MAX_RELECTURA)}🔍</span>
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+          {extractedData.length > 0 && (
+            <div className="flex items-center gap-2 md:gap-3 w-full lg:w-auto overflow-x-auto pb-2 lg:pb-0 scrollbar-hide">
+              <div className="relative flex-shrink-0">
+                <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                <input placeholder="Filtro..." value={tableFilter} onChange={(e) => setTableFilter(e.target.value)} className="pl-9 pr-4 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs outline-none focus:border-blue-400 focus:bg-white transition-all w-32 md:w-48" />
+              </div>
+              <button onClick={async () => {
+                const csv = getCsvString();
+                // Solo cabecera = ninguna fila tiene coincidencia en la maestra. Copiar
+                // eso en silencio es indistinguible de un botón roto.
+                if (csv.split("\n").length <= 1) {
+                  mostrarToast("error", "No hay filas con coincidencia en la maestra para copiar.");
+                  return;
+                }
+                const ok = await copiarTexto(csv);
+                mostrarToast(
+                  ok ? "ok" : "error",
+                  ok ? `${csv.split("\n").length - 1} fila(s) copiadas al portapapeles.`
+                     : "No se pudo copiar. Usa el botón Descargar."
+                );
+              }} className="flex-shrink-0 flex items-center gap-1.5 px-3 py-1.5 text-xs md:text-sm font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors"><Copy size={14} /> <span className="hidden md:inline">Copiar</span></button>
+              <button onClick={() => {
+                const blob = new Blob([getCsvString()], { type: "text/csv;charset=utf-8;" });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement("a");
+                link.href = url; link.setAttribute("download", "participantes.csv");
+                // Algunos navegadores ignoran el click si el enlace no está en el DOM.
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                URL.revokeObjectURL(url);
+              }} className="flex-shrink-0 flex items-center gap-1.5 px-3 py-1.5 text-xs md:text-sm font-medium text-white bg-slate-800 rounded-lg hover:bg-slate-900 transition-colors"><Download size={14} /> <span className="hidden md:inline">Descargar</span></button>
+              <button
+                disabled={sending || displayedData.length === 0}
+                onClick={() => { setIdRefInput(""); setSheetsModal(true); }}
+                className="flex-shrink-0 flex items-center gap-1.5 px-3 py-1.5 text-xs md:text-sm font-medium text-white bg-green-600 rounded-lg hover:bg-green-700 transition-colors"
+              >
+                {sending ? <Loader2 size={14} className="animate-spin" /> : <Database size={14} />}
+                <span className="hidden md:inline">Enviar a Sheets</span><span className="md:hidden">Sheets</span>
+              </button>
+            </div>
+          )}
+        </header>
+
+        <div className="flex-1 overflow-y-auto p-8 relative scrollbar-hide">
+          {status === "error" && errorMessage && (
+            <motion.div 
+              initial={{ opacity: 0, y: -20 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="mb-6 p-4 bg-red-50 border border-red-200 rounded-2xl flex items-start gap-3 text-red-700 shadow-sm"
+            >
+              <AlertCircle className="flex-shrink-0 mt-0.5" size={20} />
+              <div>
+                <p className="text-sm font-bold">Error de Extracción</p>
+                <p className="text-xs mt-1 leading-relaxed opacity-90 font-mono bg-white/50 p-2 rounded-lg border border-red-100 mt-2">{errorMessage}</p>
+                <button 
+                  onClick={() => setStatus("idle")}
+                  className="mt-3 text-[10px] font-bold uppercase tracking-wider bg-red-700 text-white px-3 py-1.5 rounded-lg hover:bg-red-800 transition-colors"
+                >
+                  Entendido
+                </button>
+              </div>
+            </motion.div>
+          )}
+
+          {extractedData.length > 0 && (
+            <div className="w-full flex flex-col mb-20 md:mb-6">
+              
+              {/* VISTA MÓVIL: TARJETAS */}
+              <div className="md:hidden flex flex-col gap-4">
+                {displayedData.map((row) => {
+                  const master = getMasterInfo(row.dni);
+                  const isValid = !!master;
+                  return (
+                    <div key={row.id} className="bg-white rounded-2xl shadow-sm border border-slate-200 p-4 flex flex-col gap-3 relative overflow-hidden">
+                      <div className={`absolute top-0 left-0 w-1.5 h-full ${isValid ? 'bg-emerald-500' : 'bg-red-500'}`}></div>
+                      <div className="flex items-center justify-between pl-2 border-b border-slate-100 pb-2">
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs font-bold text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full">#{row.nro}</span>
+                          <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${isValid ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"}`}>{isValid ? "VÁLIDO" : "SIN MATCH"}</span>
+                        </div>
+                        <button onClick={() => handleViewRow(row)} className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-50 text-blue-600 hover:bg-blue-100 rounded-lg transition-colors text-xs font-bold"><Eye size={14} /> Ver Doc</button>
+                      </div>
+                      
+                      <div className="pl-2 flex flex-col gap-2">
+                        <div>
+                          <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-0.5">Apellidos y Nombres (Extraído)</p>
+                          <p className="text-sm font-semibold text-slate-800 leading-tight">{highlightMatch(row.nombre, tableFilter)}</p>
+                        </div>
+                        
+                        <div>
+                          <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-0.5">DNI</p>
+                          <input type="text" value={row.dni} onChange={(e) => {
+                            const updated = extractedData.map(r => r.id === row.id ? { ...r, dni: e.target.value, method: "MANUAL" as MatchMethod } : r);
+                            setExtractedData(updated);
+                          }} onFocus={() => setEditingRowId(row.id)} onBlur={() => setEditingRowId(null)} className={`w-full max-w-[200px] px-3 py-1.5 rounded-lg border outline-none transition-all font-mono text-sm ${isValid ? "bg-emerald-50 border-emerald-200 text-emerald-800" : "bg-red-50 border-red-200 text-red-800"}`} />
+                        </div>
+
+                        {isValid && (
+                          <div className="mt-2 bg-slate-50 rounded-xl p-3 border border-slate-100">
+                            <p className="text-[10px] text-blue-500 font-bold uppercase tracking-wider mb-1 flex items-center gap-1"><Database size={10}/> Datos Maestros</p>
+                            <p className="text-xs font-semibold text-slate-700 truncate">{master.nombre}</p>
+                            <div className="flex gap-2 mt-1">
+                                <span className="text-[10px] bg-white border border-slate-200 px-2 py-0.5 rounded text-slate-500 font-mono">{master.dni}</span>
+                                <span className="text-[10px] bg-white border border-slate-200 px-2 py-0.5 rounded text-slate-500 truncate">{master.cargo}</span>
+                            </div>
+                          </div>
+                        )}
+                        
+                        {!isValid && row.matchCandidates && row.matchCandidates.length > 0 && (
+                          <div className="relative">
+                            <button
+                              onClick={() => setActiveCandidateRow(activeCandidateRow === row.id ? null : row.id)}
+                              className="text-[10px] font-bold text-amber-700 bg-amber-50 border border-amber-200 px-2 py-1 rounded-lg hover:bg-amber-100 transition-colors"
+                            >
+                              💡 {row.matchCandidates.length} sugerencia{row.matchCandidates.length > 1 ? "s" : ""}
+                            </button>
+                            {activeCandidateRow === row.id && (
+                              <div className="absolute left-0 top-full mt-1 z-50 bg-white border border-amber-200 rounded-xl shadow-lg p-2 min-w-[240px]">
+                                {row.matchCandidates.map((c, ci) => (
+                                  <button key={ci} onClick={() => {
+                                    const updated = extractedData.map(r => r.id === row.id ? { ...r, dni: c.master.dni, method: "IA" as MatchMethod, matchConfidence: c.score } : r);
+                                    setExtractedData(updated);
+                                    setActiveCandidateRow(null);
+                                  }} className="w-full text-left px-3 py-2 hover:bg-amber-50 rounded-lg transition-colors">
+                                    <div className="flex items-center justify-between gap-2">
+                                      <span className="text-xs font-semibold text-slate-800 truncate">{c.master.nombre}</span>
+                                      <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0 ${confidenceLevel(c.score) === "high" ? "bg-emerald-100 text-emerald-700" : confidenceLevel(c.score) === "medium" ? "bg-amber-100 text-amber-700" : "bg-red-100 text-red-700"}`}>{Math.round(c.score * 100)}%</span>
+                                    </div>
+                                    <span className="text-[10px] text-slate-400 font-mono">{c.master.dni}</span>
+                                  </button>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        <div className="flex items-center justify-between mt-1">
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            {row.filaDoc && (
+                              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-bold bg-indigo-100 text-indigo-700 border border-indigo-200 shrink-0">
+                                <FileDigit size={10} /> Fila {row.filaDoc}
+                              </span>
+                            )}
+                            <span className="text-[9px] text-slate-400 italic truncate max-w-[120px]">{row.sourceFile}</span>
+                          </div>
+                          <span className={`px-2 py-0.5 rounded text-[9px] font-bold border ${
+                            row.method === "IA"
+                              ? row.matchConfidence != null && confidenceLevel(row.matchConfidence) === "high"
+                                ? "bg-emerald-100 text-emerald-700 border-emerald-200"
+                                : row.matchConfidence != null && confidenceLevel(row.matchConfidence) === "medium"
+                                  ? "bg-amber-100 text-amber-700 border-amber-200"
+                                  : "bg-purple-100 text-purple-700 border-purple-200"
+                              : row.method === "MANUAL" ? "bg-amber-100 text-amber-700 border-amber-200" : "bg-slate-100 text-slate-600 border-slate-200"
+                          }`}>
+                            {row.method === "IA" && row.matchConfidence != null
+                              ? `IA ${Math.round(row.matchConfidence * 100)}%`
+                              : row.method}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* VISTA ESCRITORIO: TABLA */}
+              <div className="hidden md:flex bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden flex-col">
+                <div className="overflow-x-auto">
+                  <table className="min-w-full text-left text-sm text-slate-600 border-collapse table-fixed">
+                    <thead className="text-[11px] text-slate-500 bg-slate-50/80 sticky top-0 uppercase font-bold tracking-wider z-30">
+                      <tr>
+                        <th className="px-4 py-4 border-b border-slate-200 relative group/th" style={{ width: colWidths.nro, minWidth: 50 }}>Nro<div className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-blue-400 opacity-0 group-hover/th:opacity-100 transition-opacity z-10" onMouseDown={(e) => { e.preventDefault(); handleResizeStart('nro', e.clientX, colWidths.nro); }} /></th>
+                        <th className="px-4 py-4 border-b border-slate-200 text-center relative group/th" style={{ width: colWidths.ver, minWidth: 50 }}>Ver<div className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-blue-400 opacity-0 group-hover/th:opacity-100 transition-opacity z-10" onMouseDown={(e) => { e.preventDefault(); handleResizeStart('ver', e.clientX, colWidths.ver); }} /></th>
+                        <HeaderCell label="Apellidos y Nombres" colKey="nombre" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("nombre")} isFiltered={(activeFilters["nombre"]?.length || 0) > 0} width={colWidths.nombre} onResizeStart={handleResizeStart} />
+                        <HeaderCell label="DNI" colKey="dni" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("dni")} isFiltered={(activeFilters["dni"]?.length || 0) > 0} width={colWidths.dni} onResizeStart={handleResizeStart} />
+                        <HeaderCell label="Estado" colKey="estado" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("estado")} isFiltered={(activeFilters["estado"]?.length || 0) > 0} center width={colWidths.estado} onResizeStart={handleResizeStart} />
+                        <HeaderCell label="Método" colKey="method" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("method")} isFiltered={(activeFilters["method"]?.length || 0) > 0} center width={colWidths.method} onResizeStart={handleResizeStart} />
+                        <HeaderCell label="Origen" colKey="sourceFile" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("sourceFile")} isFiltered={(activeFilters["sourceFile"]?.length || 0) > 0} width={colWidths.sourceFile} onResizeStart={handleResizeStart} />
+                        <HeaderCell label="Fila Doc" colKey="filaDoc" sortConfig={sortConfig} onSort={toggleSort} onFilter={() => setOpenFilterMenu("filaDoc")} isFiltered={(activeFilters["filaDoc"]?.length || 0) > 0} center width={colWidths.filaDoc} onResizeStart={handleResizeStart} />
+                        <th className="px-6 py-4 border-b border-slate-200 border-l border-slate-200 text-blue-600 relative group/th" style={{ width: colWidths.dniSheets, minWidth: 50 }}>DNI Sheets<div className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-blue-400 opacity-0 group-hover/th:opacity-100 transition-opacity z-10" onMouseDown={(e) => { e.preventDefault(); handleResizeStart('dniSheets', e.clientX, colWidths.dniSheets); }} /></th>
+                        <th className="px-6 py-4 border-b border-slate-200 text-blue-600 relative group/th" style={{ width: colWidths.nombreOficial, minWidth: 50 }}>Nombre Oficial<div className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-blue-400 opacity-0 group-hover/th:opacity-100 transition-opacity z-10" onMouseDown={(e) => { e.preventDefault(); handleResizeStart('nombreOficial', e.clientX, colWidths.nombreOficial); }} /></th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 font-mono">
+                      {displayedData.map((row) => {
+                        const master = getMasterInfo(row.dni);
+                        const isValid = !!master;
+                        return (
+                          <tr key={row.id} className="hover:bg-slate-50/50 transition-colors group/row">
+                            <td className="px-4 py-3 text-slate-400">{row.nro}</td>
+                            <td className="px-4 py-3 text-center">
+                              <button onClick={() => handleViewRow(row)} className="p-1.5 text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"><Eye size={16} /></button>
+                            </td>
+                            <td className="px-6 py-3 truncate max-w-[180px] text-slate-800">{highlightMatch(row.nombre, tableFilter)}</td>
+                            {/* px-2 en vez de px-6: el margen de la celda se lo comía el DNI */}
+                            <td className="px-2 py-3">
+                              <input type="text" value={row.dni} title={row.dni} onChange={(e) => {
+                                const updated = extractedData.map(r => r.id === row.id ? { ...r, dni: e.target.value, method: "MANUAL" as MatchMethod } : r);
+                                setExtractedData(updated);
+                              }} onFocus={() => setEditingRowId(row.id)} onBlur={() => setEditingRowId(null)} className={`w-full min-w-[104px] px-2 py-1 rounded border outline-none transition-all font-mono text-sm tracking-tight ${isValid ? "bg-emerald-50 border-emerald-200 text-emerald-800" : "bg-red-50 border-red-200 text-red-800"}`} />
+                              {/* Resaltado visual en el input del DNI */}
+                              {tableFilter && row.dni.toLowerCase().includes(tableFilter.toLowerCase()) && (
+                                <div style={{ position: 'absolute', right: 8, top: 8, pointerEvents: 'none' }}>
+                                  <mark style={{ background: '#ffe066', padding: 0 }}>{tableFilter}</mark>
+                                </div>
+                              )}
+                            </td>
+                            <td className="px-4 py-3 text-center">
+                              <span className={`inline-flex items-center px-2 py-1 rounded-full text-[10px] font-bold ${isValid ? "bg-emerald-100 text-emerald-700" : "bg-red-100 text-red-700"}`}>{isValid ? "OK" : "FUERA"}</span>
+                            </td>
+                            <td className="px-4 py-3 text-center">
+                              <div className="flex flex-col items-center gap-1">
+                                <span className={`inline-flex items-center px-2 py-0.5 rounded text-[9px] font-bold border ${
+                                  row.method === "IA"
+                                    ? row.matchConfidence != null && confidenceLevel(row.matchConfidence) === "high"
+                                      ? "bg-emerald-100 text-emerald-700 border-emerald-200"
+                                      : row.matchConfidence != null && confidenceLevel(row.matchConfidence) === "medium"
+                                        ? "bg-amber-100 text-amber-700 border-amber-200"
+                                        : "bg-purple-100 text-purple-700 border-purple-200"
+                                    : row.method === "MANUAL" ? "bg-amber-100 text-amber-700 border-amber-200" : "bg-slate-100 text-slate-600 border-slate-200"
+                                }`}>
+                                  {row.method === "IA" && row.matchConfidence != null
+                                    ? `IA ${Math.round(row.matchConfidence * 100)}%`
+                                    : row.method}
+                                </span>
+                                {!isValid && row.matchCandidates && row.matchCandidates.length > 0 && (
+                                  <div className="relative">
+                                    <button
+                                      onClick={() => setActiveCandidateRow(activeCandidateRow === row.id ? null : row.id)}
+                                      className="text-[9px] font-bold text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded hover:bg-amber-100 transition-colors"
+                                    >
+                                      💡 {row.matchCandidates.length}
+                                    </button>
+                                    {activeCandidateRow === row.id && (
+                                      <div className="absolute right-0 top-full mt-1 z-50 bg-white border border-amber-200 rounded-xl shadow-lg p-2 min-w-[260px]">
+                                        {row.matchCandidates.map((c, ci) => (
+                                          <button key={ci} onClick={() => {
+                                            const updated = extractedData.map(r => r.id === row.id ? { ...r, dni: c.master.dni, method: "IA" as MatchMethod, matchConfidence: c.score } : r);
+                                            setExtractedData(updated);
+                                            setActiveCandidateRow(null);
+                                          }} className="w-full text-left px-3 py-2 hover:bg-amber-50 rounded-lg transition-colors">
+                                            <div className="flex items-center justify-between gap-2">
+                                              <span className="text-xs font-semibold text-slate-800 truncate">{c.master.nombre}</span>
+                                              <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0 ${confidenceLevel(c.score) === "high" ? "bg-emerald-100 text-emerald-700" : confidenceLevel(c.score) === "medium" ? "bg-amber-100 text-amber-700" : "bg-red-100 text-red-700"}`}>{Math.round(c.score * 100)}%</span>
+                                            </div>
+                                            <span className="text-[10px] text-slate-400 font-mono">{c.master.dni}</span>
+                                          </button>
+                                        ))}
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            </td>
+                            <td className="px-6 py-3 text-[10px] text-slate-400 italic truncate max-w-[100px]">{row.sourceFile}</td>
+                            <td className="px-4 py-3 text-center">
+                              {row.filaDoc ? (
+                                <button
+                                  onClick={() => handleViewRow(row)}
+                                  title={`Identificado en la fila ${row.filaDoc} de ${row.sourceFile || "el documento"}`}
+                                  className="inline-flex items-center gap-1 px-2 py-1 rounded-full text-[10px] font-bold bg-indigo-100 text-indigo-700 border border-indigo-200 hover:bg-indigo-200 transition-colors"
+                                >
+                                  <FileDigit size={11} /> Fila {row.filaDoc}
+                                </button>
+                              ) : (
+                                <span className="text-slate-300 text-xs">—</span>
+                              )}
+                            </td>
+                            <td className="px-6 py-3 bg-slate-50/30 border-l border-slate-100 text-slate-500 italic">{master ? master.dni : "---"}</td>
+                            <td className="px-6 py-3 bg-slate-50/30 text-slate-600">{master ? master.nombre : "---"}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+            </div>
+          )}
+
+          {status === "processing" && (
+            <div className="absolute inset-0 z-50 bg-white/60 backdrop-blur-sm flex flex-col items-center justify-center">
+              <div className="bg-white p-8 rounded-3xl shadow-2xl border border-slate-100 flex flex-col items-center gap-6 max-w-sm text-center">
+                <div className="relative">
+                  <div className="absolute inset-0 bg-blue-100 rounded-full animate-ping opacity-20" />
+                  <div className="relative p-5 bg-blue-50 text-blue-600 rounded-full">
+                    <Sparkles size={32} className="animate-pulse" />
+                  </div>
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-slate-800 mb-2">Extrayendo Datos con IA</h3>
+                  <p className="text-sm text-slate-500 leading-relaxed">Estamos analizando tus documentos. Esto puede tomar unos segundos dependiendo de la complejidad...</p>
+                </div>
+                <div className="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden">
+                  <motion.div 
+                    initial={{ x: "-100%" }}
+                    animate={{ x: "100%" }}
+                    transition={{ repeat: Infinity, duration: 1.5, ease: "linear" }}
+                    className="w-1/2 h-full bg-blue-600 rounded-full"
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <AnimatePresence>
+          {openFilterMenu && (
+            <div className="fixed inset-0 z-[100]" onClick={() => setOpenFilterMenu(null)}>
+              <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} className="absolute bg-white rounded-xl shadow-2xl border border-slate-200 w-56 py-2 overflow-hidden" style={{ top: '150px', left: '400px' }} onClick={e => e.stopPropagation()}>
+                <div className="px-4 py-2 border-b border-slate-100 flex justify-between items-center"><span className="text-[11px] font-bold text-slate-500 uppercase">Filtrar {openFilterMenu}</span><button onClick={() => setActiveFilters(prev => ({ ...prev, [openFilterMenu]: [] }))} className="text-[10px] text-blue-600 hover:underline">Limpiar</button></div>
+                <div className="max-h-60 overflow-y-auto">
+                  {getUniqueValues(openFilterMenu).map(val => (
+                    <div key={val} className="px-4 py-2 hover:bg-slate-50 cursor-pointer flex items-center justify-between group" onClick={() => toggleFilterValue(openFilterMenu, val)}>
+                      <span className="text-xs text-slate-700 truncate">{val}</span>
+                      {(activeFilters[openFilterMenu] || []).includes(val) && <Check size={14} className="text-blue-600" />}
+                    </div>
+                  ))}
+                </div>
+              </motion.div>
+            </div>
+          )}
+        </AnimatePresence>
+      </main>
+
+      {/* Aviso cuando no se puede abrir el documento de una fila */}
+      <AnimatePresence>
+        {viewerError && (
+          <motion.div
+            initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }}
+            className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[300] max-w-[92vw] md:max-w-md bg-slate-900 text-white rounded-2xl shadow-2xl border border-white/10 px-4 py-3 flex items-start gap-3"
+          >
+            <AlertCircle size={18} className="text-amber-400 shrink-0 mt-0.5" />
+            <p className="text-xs leading-relaxed flex-1">{viewerError}</p>
+            <button onClick={() => setViewerError(null)} className="text-white/50 hover:text-white shrink-0 transition-colors"><X size={16} /></button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* REIMAGINED ZOOM VIEWER */}
+      <AnimatePresence>
+        {viewingImage && (
+          <motion.div 
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[200] bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-8 select-none"
+            onWheel={handleWheel}
+          >
+            {/* Header Controls */}
+            <div className="absolute top-0 left-0 right-0 p-4 md:p-6 flex flex-wrap items-center justify-between bg-gradient-to-b from-black/60 via-black/40 to-transparent z-50 pointer-events-none gap-4">
+              <div className="flex items-center gap-3 pointer-events-auto">
+                <button onClick={() => setViewingImage(null)} className="md:hidden p-2.5 bg-white/10 backdrop-blur-xl text-white rounded-xl border border-white/20 shadow-2xl transition-all"><X size={24}/></button>
+                <div className="hidden md:flex p-2.5 bg-blue-600 text-white rounded-xl shadow-lg"><ImageIcon size={20} /></div>
+                <div className="flex-1 min-w-0">
+                  <h3 className="text-white font-semibold text-xs md:text-sm leading-tight truncate max-w-[150px] md:max-w-md">{viewingImage.name}</h3>
+                  <p className="text-slate-300 text-[9px] md:text-[10px] uppercase tracking-widest font-bold flex items-center gap-2 flex-wrap">
+                    <span>Modo Inspección</span>
+                    {viewingImage.totalPages > 1 && <span className="text-blue-300 normal-case tracking-normal">Pág {viewingImage.pagina}/{viewingImage.totalPages}</span>}
+                    {viewingImage.fila && <span className="text-red-300 normal-case tracking-normal">Fila {viewingImage.fila}</span>}
+                    {viewingImage.fila && !viewingImage.bbox && <span className="text-amber-300 normal-case tracking-normal">(sin ubicación exacta)</span>}
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 pointer-events-auto ml-auto">
+                {viewingImage.bbox && (
+                  <div className="flex items-center bg-white/10 backdrop-blur-xl rounded-xl md:rounded-2xl border border-white/20 p-1 mr-1 md:mr-2 shadow-2xl" title="Ajustar la marca una fila arriba/abajo si está desfasada">
+                    <button onClick={() => setBboxNudge(n => n - 1)} className="p-1.5 md:p-2.5 text-white/80 hover:text-white hover:bg-white/10 rounded-lg md:rounded-xl transition-all"><ArrowUp size={16} className="md:w-5 md:h-5"/></button>
+                    <span className="px-1 text-[9px] md:text-[10px] font-mono font-bold text-red-300 uppercase tracking-wide select-none">Fila</span>
+                    <button onClick={() => setBboxNudge(n => n + 1)} className="p-1.5 md:p-2.5 text-white/80 hover:text-white hover:bg-white/10 rounded-lg md:rounded-xl transition-all"><ArrowDown size={16} className="md:w-5 md:h-5"/></button>
+                  </div>
+                )}
+                <div className="flex items-center bg-white/10 backdrop-blur-xl rounded-xl md:rounded-2xl border border-white/20 p-1 mr-1 md:mr-2 shadow-2xl">
+                  <button onClick={() => setZoomLevel(p => Math.max(0.5, p/1.2))} className="p-1.5 md:p-2.5 text-white/80 hover:text-white hover:bg-white/10 rounded-lg md:rounded-xl transition-all"><ZoomOut size={16} className="md:w-5 md:h-5"/></button>
+                  <div className="px-2 md:px-4 min-w-[50px] md:min-w-[70px] text-center"><span className="text-xs md:text-sm font-mono font-black text-blue-400">{(zoomLevel*100).toFixed(0)}%</span></div>
+                  <button onClick={() => setZoomLevel(p => Math.min(15, p*1.2))} className="p-1.5 md:p-2.5 text-white/80 hover:text-white hover:bg-white/10 rounded-lg md:rounded-xl transition-all"><ZoomIn size={16} className="md:w-5 md:h-5"/></button>
+                </div>
+                <button onClick={resetViewer} className="p-2 md:p-3 bg-white/10 backdrop-blur-xl text-white/80 hover:text-white hover:bg-white/10 rounded-xl md:rounded-2xl border border-white/20 shadow-2xl transition-all" title="Reiniciar vista"><RotateCcw size={16} className="md:w-5 md:h-5"/></button>
+                <button onClick={() => setViewingImage(null)} className="hidden md:block ml-2 p-3 bg-red-500/20 text-red-400 hover:bg-red-500 hover:text-white rounded-2xl border border-red-500/30 shadow-2xl transition-all"><X size={24}/></button>
+              </div>
+            </div>
+
+            {/* Interaction Canvas */}
+            <div
+              className={`relative w-full h-full flex items-center justify-center overflow-hidden cursor-${isPanning ? 'grabbing' : 'grab'} touch-none transition-all ${viewingRow ? 'pb-[46vh] md:pb-0 md:pr-[396px]' : ''}`}
+              onMouseDown={handlePanStart}
+              onMouseMove={handlePanMove}
+              onMouseUp={handlePanEnd}
+              onMouseLeave={handlePanEnd}
+              onTouchStart={handleTouchStart}
+              onTouchMove={handleTouchMove}
+              onTouchEnd={handleTouchEnd}
+            >
+              <motion.div
+                animate={{ scale: zoomLevel, x: panOffset.x, y: panOffset.y }}
+                transition={{ type: "spring", stiffness: 300, damping: 30, mass: 0.5 }}
+                className="relative pointer-events-none"
+                style={{ width: "fit-content", height: "fit-content", lineHeight: 0 }}
+              >
+                <img
+                  src={viewingImage.url}
+                  draggable={false}
+                  className="max-w-[88vw] max-h-[85vh] object-contain shadow-[0_0_100px_rgba(0,0,0,0.5)] rounded-sm block"
+                />
+                {viewingImage.bbox && (() => {
+                  const rowH = viewingImage.bbox.ymax - viewingImage.bbox.ymin;
+                  const shift = bboxNudge * rowH;
+                  const top = Math.max(0, viewingImage.bbox.ymin + shift);
+                  return (
+                  <motion.div
+                    className="absolute border-2 border-red-500 rounded-[2px] bg-red-500/10"
+                    style={{
+                      left: `${viewingImage.bbox.xmin / 10}%`,
+                      top: `${top / 10}%`,
+                      width: `${(viewingImage.bbox.xmax - viewingImage.bbox.xmin) / 10}%`,
+                      height: `${rowH / 10}%`,
+                      boxShadow: "0 0 0 9999px rgba(2,6,23,0.55)",
+                    }}
+                    initial={{ opacity: 0.5 }}
+                    animate={{ opacity: [0.5, 1, 0.5] }}
+                    transition={{ repeat: Infinity, duration: 1.6, ease: "easeInOut" }}
+                  >
+                    {viewingImage.fila && (
+                      <span
+                        className="absolute left-0 bg-red-500 text-white text-[7px] font-bold px-1.5 py-0.5 rounded whitespace-nowrap shadow-lg"
+                        style={{ bottom: "100%", marginBottom: 2, transform: `scale(${1 / Math.max(zoomLevel, 0.6)})`, transformOrigin: "bottom left" }}
+                      >
+                        Fila {viewingImage.fila}{viewingImage.totalPages > 1 ? ` · Pág ${viewingImage.pagina}` : ""}{bboxNudge !== 0 ? ` (${bboxNudge > 0 ? "+" : ""}${bboxNudge})` : ""}
+                      </span>
+                    )}
+                  </motion.div>
+                  );
+                })()}
+              </motion.div>
+            </div>
+
+            {/* Panel de edición del registro actual */}
+            {viewingRow && (
+              <motion.div
+                initial={{ opacity: 0, y: 30 }}
+                animate={{ opacity: 1, y: 0 }}
+                onWheel={(e) => e.stopPropagation()}
+                onMouseDown={(e) => e.stopPropagation()}
+                className="absolute z-40 pointer-events-auto bg-slate-900/92 backdrop-blur-2xl text-white shadow-2xl flex flex-col
+                  inset-x-0 bottom-0 max-h-[46vh] rounded-t-3xl border-t border-white/10
+                  md:inset-y-0 md:left-auto md:right-0 md:bottom-auto md:w-[384px] md:max-h-none md:rounded-none md:border-t-0 md:border-l md:pt-20"
+              >
+                <div className="overflow-y-auto p-5 flex flex-col gap-4 scrollbar-hide">
+                  <div className="md:hidden mx-auto w-10 h-1 rounded-full bg-white/20 -mt-1 mb-1" />
+
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <UserCheck size={16} className="text-blue-400" />
+                      <span className="text-sm font-bold">Editar registro</span>
+                    </div>
+                    <span className="text-[10px] font-bold bg-red-500/20 text-red-300 border border-red-400/30 px-2 py-0.5 rounded-full whitespace-nowrap">
+                      Fila {viewingRow.filaDoc || "?"}{viewingImage.totalPages > 1 ? ` · Pág ${viewingImage.pagina}` : ""}
+                    </span>
+                  </div>
+
+                  {/* Desplegable: navegar solo entre registros FUERA (sin match) */}
+                  {(() => {
+                    const fueraRows = extractedData.filter((r) => !getMasterInfo(r.dni));
+                    return (
+                      <div>
+                        <div className="flex items-stretch gap-1.5">
+                          <button
+                            onClick={() => setViewerDropdownOpen((o) => !o)}
+                            className="flex-1 min-w-0 flex items-center justify-between gap-2 bg-red-500/10 hover:bg-red-500/15 border border-red-400/30 rounded-xl px-3 py-2 text-left transition-colors"
+                          >
+                            <div className="min-w-0">
+                              <p className="text-[9px] text-red-300 font-bold uppercase tracking-wider">Sin match (FUERA): {fueraRows.length}</p>
+                              <p className="text-xs font-semibold text-white truncate">
+                                {viewingRowMaster ? "Este registro ya tiene match ✓" : `Fila ${viewingRow.filaDoc || "?"} · ${viewingRow.nombre || "—"}`}
+                              </p>
+                            </div>
+                            <ChevronDown size={16} className={`text-white/60 shrink-0 transition-transform ${viewerDropdownOpen ? "rotate-180" : ""}`} />
+                          </button>
+
+                          {/* Recorrer la cola de revisión sin abrir el desplegable */}
+                          <div className="flex items-center gap-1 shrink-0">
+                            <button
+                              onClick={() => goToQueue(-1)}
+                              disabled={viewerQueueIdx <= 0}
+                              title="Registro anterior"
+                              className="h-full px-2 rounded-xl border border-white/15 bg-white/5 text-white/80 hover:bg-white/10 hover:text-white disabled:opacity-30 disabled:hover:bg-white/5 transition-colors"
+                            >
+                              <ChevronLeft size={18} />
+                            </button>
+                            <button
+                              onClick={() => goToQueue(1)}
+                              disabled={viewerQueueIdx < 0 || viewerQueueIdx >= viewerQueue.length - 1}
+                              title="Registro siguiente"
+                              className="h-full px-2 rounded-xl border border-white/15 bg-white/5 text-white/80 hover:bg-white/10 hover:text-white disabled:opacity-30 disabled:hover:bg-white/5 transition-colors"
+                            >
+                              <ChevronRight size={18} />
+                            </button>
+                          </div>
+                        </div>
+                        {viewerQueueIdx >= 0 && viewerQueue.length > 1 && (
+                          <p className="text-[9px] text-white/35 font-bold text-center mt-1 tabular-nums">
+                            {viewerQueueIdx + 1} de {viewerQueue.length} por revisar
+                          </p>
+                        )}
+                        {viewerDropdownOpen && (
+                          <div className="mt-1 bg-slate-800/95 border border-white/10 rounded-xl max-h-64 overflow-y-auto scrollbar-hide divide-y divide-white/5">
+                            {fueraRows.length === 0 && <p className="text-xs text-white/40 py-4 text-center">No hay registros FUERA 🎉</p>}
+                            {fueraRows.map((r) => (
+                              <button
+                                key={r.id}
+                                onClick={() => { handleViewRow(r); setViewerDropdownOpen(false); }}
+                                className={`w-full text-left px-3 py-2 hover:bg-white/5 flex items-center gap-2 transition-colors ${r.id === viewingRow.id ? "bg-red-500/15" : ""}`}
+                              >
+                                <span className="text-[10px] font-mono font-bold text-red-300 bg-red-500/15 px-1.5 py-0.5 rounded shrink-0">F{r.filaDoc || "?"}</span>
+                                <div className="min-w-0 flex-1">
+                                  <p className="text-xs font-semibold text-white truncate">{r.nombre || "—"}</p>
+                                  <p className="text-[10px] text-white/40 font-mono truncate">{r.dni || "sin DNI"} · {r.sourceFile}</p>
+                                </div>
+                                {r.id === viewingRow.id && <Check size={14} className="text-red-300 shrink-0" />}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
+
+                  <div>
+                    <p className="text-[10px] text-white/40 font-bold uppercase tracking-wider mb-1">Apellidos y Nombres (Extraído)</p>
+                    <p className="text-sm font-semibold text-white leading-snug bg-white/5 border border-white/10 rounded-xl px-3 py-2 break-words">{viewingRow.nombre || "—"}</p>
+                  </div>
+
+                  <div>
+                    <p className="text-[10px] text-white/40 font-bold uppercase tracking-wider mb-1">DNI</p>
+                    <div className="flex items-center gap-2">
+                      <input
+                        value={viewingRow.dni}
+                        onChange={(e) => applyDniToRow(viewingRow.id, e.target.value, "MANUAL")}
+                        className={`flex-1 px-3 py-2 rounded-xl border outline-none font-mono text-sm transition-all ${viewingRowMaster ? "bg-emerald-500/15 border-emerald-400/40 text-emerald-200" : "bg-red-500/15 border-red-400/40 text-red-200"}`}
+                      />
+                      <span className={`text-[10px] font-bold px-2 py-1 rounded-lg whitespace-nowrap ${viewingRowMaster ? "bg-emerald-500/20 text-emerald-300" : "bg-red-500/20 text-red-300"}`}>{viewingRowMaster ? "OK" : "FUERA"}</span>
+                    </div>
+                  </div>
+
+                  {viewingRowMaster && (
+                    <div className="bg-emerald-500/10 border border-emerald-400/20 rounded-xl p-3">
+                      <p className="text-[10px] text-emerald-300 font-bold uppercase tracking-wider mb-1 flex items-center gap-1"><Database size={10} /> Dato Maestro</p>
+                      <p className="text-sm font-semibold text-white">{viewingRowMaster.nombre}</p>
+                      <div className="flex flex-wrap gap-1.5 mt-1.5">
+                        <span className="text-[10px] bg-white/10 px-2 py-0.5 rounded font-mono text-white/70">{viewingRowMaster.dni}</span>
+                        {viewingRowMaster.cargo && <span className="text-[10px] bg-white/10 px-2 py-0.5 rounded text-white/70">{viewingRowMaster.cargo}</span>}
+                        {viewingRowMaster.area && <span className="text-[10px] bg-white/10 px-2 py-0.5 rounded text-white/70">{viewingRowMaster.area}</span>}
+                      </div>
+                    </div>
+                  )}
+
+                  {!viewingRowMaster && viewingRow.matchCandidates && viewingRow.matchCandidates.length > 0 && (
+                    <div className="flex flex-col gap-1.5">
+                      <p className="text-[10px] text-amber-300 font-bold uppercase tracking-wider">💡 Sugerencias</p>
+                      {viewingRow.matchCandidates.map((c, ci) => (
+                        <button key={ci} onClick={() => applyDniToRow(viewingRow.id, c.master.dni, "IA", c.score)} className="text-left bg-amber-500/10 hover:bg-amber-500/20 border border-amber-400/20 rounded-xl px-3 py-2 transition-colors">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-semibold text-white truncate">{c.master.nombre}</span>
+                            <span className="text-[10px] font-bold text-amber-300 shrink-0">{Math.round(c.score * 100)}%</span>
+                          </div>
+                          <span className="text-[10px] text-white/50 font-mono">{c.master.dni}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="border-t border-white/10 pt-4">
+                    <p className="text-[10px] text-white/40 font-bold uppercase tracking-wider mb-2 flex items-center gap-1"><Search size={11} /> Buscar en lista maestra</p>
+                    <div className="flex items-center gap-2 bg-white/10 border border-white/15 rounded-xl px-3 py-2 mb-2">
+                      <Search size={14} className="text-white/40 shrink-0" />
+                      <input value={viewerQuery} onChange={(e) => setViewerQuery(e.target.value)} placeholder="Nombre, apellido o DNI..." className="flex-1 bg-transparent text-white text-sm placeholder-white/40 outline-none" />
+                      {viewerQuery && <button onClick={() => setViewerQuery("")} className="text-white/40 hover:text-white"><X size={14} /></button>}
+                    </div>
+                    <div className="flex flex-col gap-1 max-h-52 md:max-h-none overflow-y-auto scrollbar-hide">
+                      {viewerQuery.trim() && viewerResults.length === 0 && (
+                        <p className="text-xs text-white/40 py-3 text-center">Sin resultados para "{viewerQuery}"</p>
+                      )}
+                      {viewerResults.map(({ master: m, score }, i) => {
+                        const isCurrent = normalizeDniStrict(m.dni) === normalizeDniStrict(viewingRow.dni) && !!normalizeDniStrict(m.dni);
+                        return (
+                          <button key={i} onClick={() => applyDniToRow(viewingRow.id, m.dni, "MANUAL")} className={`text-left rounded-xl px-3 py-2 border transition-colors ${isCurrent ? "bg-emerald-500/15 border-emerald-400/40" : "bg-white/5 hover:bg-white/10 border-white/10"}`}>
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-xs font-semibold text-white truncate">{highlightSearchMatch(m.nombre, viewerQuery)}</span>
+                              {isCurrent ? <Check size={14} className="text-emerald-400 shrink-0" /> : <span className="text-[9px] text-white/40 shrink-0">{score >= 1.5 ? '●●●' : score >= 0.8 ? '●●○' : '●○○'}</span>}
+                            </div>
+                            <span className="text-[10px] text-white/60 font-mono">{highlightSearchMatch(m.dni, normalizeDniStrict(viewerQuery).length >= 2 ? viewerQuery : '')}</span>
+                            {(m.cargo || m.area) && <span className="text-[9px] text-white/40 block truncate">{[m.cargo, m.area].filter(Boolean).join(' · ')}</span>}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              </motion.div>
+            )}
+
+            {/* Hint Overlay */}
+            {!viewingRow && (
+            <div className="absolute bottom-10 left-1/2 -translate-x-1/2 hidden md:flex items-center gap-6 px-8 py-4 bg-black/40 backdrop-blur-2xl rounded-3xl border border-white/10 shadow-2xl pointer-events-none opacity-60">
+              <div className="flex items-center gap-2 text-white/80 text-[10px] font-bold uppercase tracking-widest"><MousePointer2 size={14} className="text-blue-400" /> Rueda: Zoom</div>
+              <div className="h-4 w-[1px] bg-white/10" />
+              <div className="flex items-center gap-2 text-white/80 text-[10px] font-bold uppercase tracking-widest"><Grab size={14} className="text-blue-400" /> Click: Arrastrar</div>
+              <div className="h-4 w-[1px] bg-white/10" />
+              <div className="flex items-center gap-2 text-white/80 text-[10px] font-bold uppercase tracking-widest"><Maximize2 size={14} className="text-blue-400" /> Doble Click: Reset</div>
+            </div>
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Floating Search (FAB) */}
+      <div className="fixed bottom-8 right-8 z-50 flex flex-col items-end gap-3">
+        <AnimatePresence>
+          {showSearch && (
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 10 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 10 }}
+              className="bg-white border border-slate-200 rounded-2xl shadow-2xl overflow-hidden flex flex-col"
+              style={{ width: 360, maxHeight: 520 }}
+            >
+              {/* Header / Input */}
+              <div className="p-3 bg-gradient-to-r from-blue-600 to-indigo-600">
+                <div className="flex items-center gap-2 bg-white/15 border border-white/25 rounded-xl px-3 py-2">
+                  <Search size={14} className="text-white/70 shrink-0" />
+                  <input
+                    autoFocus
+                    placeholder="Buscar por nombre, apellido o DNI..."
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    className="flex-1 bg-transparent text-white text-sm placeholder-white/60 outline-none"
+                  />
+                  {searchQuery && (
+                    <button onClick={() => setSearchQuery("")} className="text-white/60 hover:text-white transition-colors">
+                      <X size={14} />
+                    </button>
+                  )}
+                </div>
+                {searchQuery.trim() && (
+                  <p className="text-white/60 text-[10px] mt-2 px-1">
+                    {searchResults.length} resultado{searchResults.length !== 1 ? "s" : ""} · click para copiar DNI
+                  </p>
+                )}
+              </div>
+
+              {/* Results */}
+              <div className="overflow-y-auto flex-1">
+                {!searchQuery.trim() && (
+                  <div className="flex flex-col items-center justify-center py-10 text-slate-400 gap-2">
+                    <Search size={28} className="opacity-30" />
+                    <p className="text-xs font-medium">Escribe para buscar en la lista maestra</p>
+                    <p className="text-[10px] opacity-70">Nombre, apellido o DNI</p>
+                  </div>
+                )}
+                {searchQuery.trim() && searchResults.length === 0 && (
+                  <div className="flex flex-col items-center justify-center py-10 text-slate-400 gap-2">
+                    <AlertCircle size={24} className="opacity-40" />
+                    <p className="text-xs font-medium">Sin resultados para "{searchQuery}"</p>
+                    <p className="text-[10px] opacity-70">Prueba con otro nombre o parte del DNI</p>
+                  </div>
+                )}
+                {searchResults.map(({ master: m, score, matchType }, i) => (
+                  <button
+                    key={i}
+                    onClick={async () => {
+                      // Mismo motivo que en el botón Copiar: fuera de contexto seguro
+                      // navigator.clipboard no existe y esto reventaba en silencio.
+                      const ok = await copiarTexto(m.dni);
+                      if (!ok) { mostrarToast("error", "No se pudo copiar el DNI."); return; }
+                      setCopiedDni(m.dni);
+                      setTimeout(() => setCopiedDni(null), 1500);
+                    }}
+                    className="w-full text-left px-4 py-3 hover:bg-blue-50 transition-colors border-b border-slate-50 last:border-0 group/item"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-bold text-slate-800 uppercase leading-snug truncate">
+                          {highlightSearchMatch(m.nombre, searchQuery)}
+                        </p>
+                        <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                          <span className={`font-mono text-[11px] font-bold ${matchType === 'dni_exact' || matchType === 'dni_partial' ? 'text-blue-600' : 'text-slate-500'}`}>
+                            {highlightSearchMatch(m.dni, normalizeDniStrict(searchQuery).length >= 3 ? searchQuery : '')}
+                          </span>
+                          {(matchType === 'dni_exact' || matchType === 'dni_partial') && (
+                            <span className="text-[8px] bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded-full font-bold uppercase tracking-wide">DNI</span>
+                          )}
+                          {matchType === 'fuzzy' && (
+                            <span className="text-[8px] bg-purple-100 text-purple-600 px-1.5 py-0.5 rounded-full font-bold uppercase tracking-wide">~aprox</span>
+                          )}
+                        </div>
+                        {(m.cargo || m.area) && (
+                          <div className="flex gap-1.5 mt-1 flex-wrap">
+                            {m.cargo && <span className="text-[9px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded truncate max-w-[160px]">{m.cargo}</span>}
+                            {m.area && <span className="text-[9px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded truncate max-w-[120px]">{m.area}</span>}
+                          </div>
+                        )}
+                      </div>
+                      <div className="shrink-0 flex flex-col items-end gap-1">
+                        {copiedDni === m.dni ? (
+                          <span className="text-[9px] bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full font-bold">¡Copiado!</span>
+                        ) : (
+                          <span className="text-[9px] text-slate-300 group-hover/item:text-slate-500 transition-colors font-medium opacity-0 group-hover/item:opacity-100">Copiar</span>
+                        )}
+                        <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded-full ${score >= 1.5 ? 'bg-emerald-100 text-emerald-700' : score >= 0.8 ? 'bg-amber-100 text-amber-700' : 'bg-slate-100 text-slate-400'}`}>
+                          {score >= 1.5 ? '●●●' : score >= 0.8 ? '●●○' : '●○○'}
+                        </span>
+                      </div>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+        <div className="flex items-center gap-3 justify-end">
+          {showSearch && searchQuery.trim() && (
+            <motion.span initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="text-[10px] text-slate-500 bg-white px-2 py-1 rounded-lg shadow border border-slate-200">
+              {searchResults.length} resultado{searchResults.length !== 1 ? "s" : ""}
+            </motion.span>
+          )}
+          <button
+            onClick={() => { setShowSearch(!showSearch); if (showSearch) setSearchQuery(""); }}
+            className={`p-4 rounded-full shadow-2xl transition-all active:scale-95 ${showSearch ? "bg-slate-800 hover:bg-slate-700" : "bg-blue-600 hover:bg-blue-700"} text-white`}
+          >
+            {showSearch ? <X size={24}/> : <SearchCode size={24}/>}
+          </button>
+        </div>
+      </div>
+
+      {/* Aviso propio. Sustituye a alert(), que en móvil se suprime a menudo y dejaba
+          acciones completándose (o fallando) sin que el usuario viera nada. */}
+      <AnimatePresence>
+        {toast && (
+          <motion.div
+            initial={{ opacity: 0, y: 24 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 24 }}
+            className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[100] max-w-[92vw]"
+          >
+            <div
+              role="status"
+              className={`flex items-start gap-2.5 px-4 py-3 rounded-xl shadow-2xl text-xs md:text-sm font-medium text-white ${toast.tipo === "ok" ? "bg-emerald-600" : "bg-red-600"}`}
+            >
+              {toast.tipo === "ok" ? <CheckCircle2 size={16} className="flex-shrink-0 mt-px" /> : <AlertCircle size={16} className="flex-shrink-0 mt-px" />}
+              <span>{toast.msg}</span>
+              <button onClick={() => setToast(null)} className="ml-1 opacity-70 hover:opacity-100 flex-shrink-0"><X size={14} /></button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* IdRef dentro de la app: prompt() es un diálogo nativo y puede no aparecer nunca,
+          en cuyo caso el envío a Sheets moría en silencio. */}
+      <AnimatePresence>
+        {sheetsModal && (
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[110] flex items-center justify-center bg-slate-900/50 p-4"
+            onClick={() => setSheetsModal(false)}
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.95, opacity: 0 }}
+              onClick={(e) => e.stopPropagation()}
+              className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-5"
+            >
+              <div className="flex items-center gap-2 mb-1">
+                <Database size={18} className="text-green-600" />
+                <h3 className="font-bold text-slate-800">Enviar a Google Sheets</h3>
+              </div>
+              <p className="text-xs text-slate-500 mb-4">
+                Se enviarán {displayedData.filter((r: ExtractedRow) => !!getMasterInfo(r.dni)).length} participante(s) con coincidencia en la maestra.
+              </p>
+              <label className="block text-xs font-semibold text-slate-600 mb-1.5">IdRef</label>
+              <input
+                autoFocus
+                value={idRefInput}
+                onChange={(e) => setIdRefInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") handleSendToSheets(idRefInput); if (e.key === "Escape") setSheetsModal(false); }}
+                placeholder="Ej. IND-2026-014"
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm outline-none focus:border-green-500 transition-colors"
+              />
+              <div className="flex gap-2 mt-4">
+                <button onClick={() => setSheetsModal(false)} className="flex-1 px-3 py-2 text-sm font-medium text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors">
+                  Cancelar
+                </button>
+                <button
+                  onClick={() => handleSendToSheets(idRefInput)}
+                  disabled={!idRefInput.trim() || sending}
+                  className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 text-sm font-bold text-white bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg transition-colors"
+                >
+                  {sending ? <Loader2 size={14} className="animate-spin" /> : <Database size={14} />} Enviar
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+function HeaderCell({ label, colKey, sortConfig, onSort, onFilter, isFiltered, center, width, onResizeStart }: any) {
+  return (
+    <th className={`px-6 py-4 border-b border-slate-200 relative group group/th ${center ? "text-center" : ""}`} style={{ width, minWidth: 50 }}>
+      <div className={`flex items-center gap-1.5 ${center ? "justify-center" : ""}`}>
+        <span className="cursor-pointer select-none" onClick={() => onSort(colKey)}>{label}</span>
+        <div className="flex flex-col opacity-0 group-hover:opacity-100 transition-opacity">
+          <button onClick={(e) => { e.stopPropagation(); onSort(colKey); }} className={`${sortConfig?.key === colKey ? "text-blue-600" : "text-slate-300"} hover:text-blue-400`}>{sortConfig?.key === colKey ? (sortConfig.direction === 'asc' ? <ArrowUp size={10}/> : <ArrowDown size={10}/>) : <ArrowUpDown size={10}/>}</button>
+        </div>
+        <button onClick={(e) => { e.stopPropagation(); onFilter(); }} className={`p-1 rounded hover:bg-slate-100 transition-colors ${isFiltered ? "text-blue-600" : "text-slate-300"}`}><Filter size={10} fill={isFiltered ? "currentColor" : "none"} /></button>
+      </div>
+      <div
+        className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-blue-400 opacity-0 group-hover/th:opacity-100 transition-opacity z-10"
+        onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); onResizeStart(colKey, e.clientX, width); }}
+      />
+    </th>
+  );
+}

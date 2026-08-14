@@ -1,0 +1,6 @@
+{
+  "name": "IntelliExtract - Asistencia OCR",
+  "description": "Extrae tablas de participantes desde registros de asistencia manuscritos a formato CSV usando modelos Gemini.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
