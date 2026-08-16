@@ -1192,7 +1192,10 @@ export default function App() {
           </div>
         </div>
 
-        <header className="flex-shrink-0 bg-white border-b border-slate-200 px-4 md:px-8 py-4 flex flex-col lg:flex-row items-start lg:items-center justify-between shadow-sm z-10 gap-4">
+        {/* `flex-wrap` en lugar de scroll horizontal: si los controles no caben en el
+            ancho disponible bajan a otra línea. Un scroll lateral escondía botones sin
+            avisar, y el header es justo donde tienen que verse todos de un vistazo. */}
+        <header className="flex-shrink-0 bg-white border-b border-slate-200 px-4 md:px-8 py-4 flex flex-col lg:flex-row flex-wrap items-start lg:items-center justify-between shadow-sm z-10 gap-3">
           <div className="flex items-center gap-4 w-full lg:w-auto justify-between">
             <h2 className="text-lg font-semibold text-slate-800 hidden md:flex items-center gap-3">
               {isSidebarCollapsed && (
@@ -1241,13 +1244,13 @@ export default function App() {
               )}
             </div>
             {extractedData.length > 0 && (
-              <div className="flex items-center gap-2">
-                <button onClick={tryFuzzyMatch} className="flex items-center gap-2 px-3 md:px-4 py-2 text-[10px] md:text-xs font-bold text-white bg-gradient-to-r from-blue-600 to-indigo-600 rounded-full hover:from-blue-700 hover:to-indigo-700 transition-all shadow-md active:scale-95 whitespace-nowrap">
-                  <Sparkles size={14} /> <span className="hidden md:inline">Vincular por Nombre (IA)</span><span className="md:hidden">IA Link</span>
+              <div className="flex flex-wrap items-center gap-2">
+                <button onClick={tryFuzzyMatch} title="Vincula los registros con la lista maestra por nombre y DNI" className="flex items-center gap-2 px-3 py-2 text-[10px] md:text-xs font-bold text-white bg-gradient-to-r from-blue-600 to-indigo-600 rounded-full hover:from-blue-700 hover:to-indigo-700 transition-all shadow-md active:scale-95 whitespace-nowrap">
+                  <Sparkles size={14} /> <span className="hidden md:inline">Vincular</span><span className="md:hidden">IA Link</span>
                 </button>
                 {extractedData.some(r => r.method === "IA" && r.matchConfidence != null && r.matchConfidence >= 0.92) && (
-                  <button onClick={acceptAllHighConfidence} className="flex items-center gap-1.5 px-3 py-2 text-[10px] md:text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-full transition-all shadow-md active:scale-95 whitespace-nowrap">
-                    <Check size={14} /> <span className="hidden md:inline">Aceptar Alta Confianza</span><span className="md:hidden">✓ AC</span>
+                  <button onClick={acceptAllHighConfidence} title="Da por buenas todas las coincidencias con confianza alta (≥92%)" className="flex items-center gap-1.5 px-3 py-2 text-[10px] md:text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-full transition-all shadow-md active:scale-95 whitespace-nowrap">
+                    <Check size={14} /> <span className="hidden md:inline">Aceptar altas</span><span className="md:hidden">✓ AC</span>
                   </button>
                 )}
                 {/* Último recurso: solo aparece si quedan filas sin resolver, y dice
@@ -1263,7 +1266,7 @@ export default function App() {
                       ? <Loader2 size={14} className="animate-spin" />
                       : <ZoomIn size={14} />}
                     <span className="hidden md:inline">
-                      {relecturaBusy ? "Releyendo…" : `Releer ${Math.min(filasSinCoincidencia.length, MAX_RELECTURA)} sin coincidencia`}
+                      {relecturaBusy ? "Releyendo…" : `Releer ${Math.min(filasSinCoincidencia.length, MAX_RELECTURA)}`}
                     </span>
                     <span className="md:hidden">{Math.min(filasSinCoincidencia.length, MAX_RELECTURA)}🔍</span>
                   </button>
@@ -1272,10 +1275,12 @@ export default function App() {
             )}
           </div>
           {extractedData.length > 0 && (
-            <div className="flex items-center gap-2 md:gap-3 w-full lg:w-auto overflow-x-auto pb-2 lg:pb-0 scrollbar-hide">
-              <div className="relative flex-shrink-0">
+            <div className="flex flex-wrap items-center gap-2 w-full lg:w-auto">
+              {/* El filtro cede ancho antes que los botones: es el único control que
+                  sigue siendo usable estrecho, así que absorbe él la falta de espacio. */}
+              <div className="relative flex-1 min-w-[7rem] lg:flex-none lg:w-40">
                 <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                <input placeholder="Filtro..." value={tableFilter} onChange={(e) => setTableFilter(e.target.value)} className="pl-9 pr-4 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs outline-none focus:border-blue-400 focus:bg-white transition-all w-32 md:w-48" />
+                <input placeholder="Filtro..." value={tableFilter} onChange={(e) => setTableFilter(e.target.value)} className="w-full pl-9 pr-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs outline-none focus:border-blue-400 focus:bg-white transition-all" />
               </div>
               <button onClick={async () => {
                 const csv = getCsvString();
