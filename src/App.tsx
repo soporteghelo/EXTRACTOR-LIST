@@ -32,7 +32,7 @@ import {
   CheckCircle2, AlertCircle, FileDigit, Download, Settings, Loader2, 
   UserCheck, UserMinus, Search, SearchCode, Eye, ZoomIn, ZoomOut, Sparkles, 
   ArrowUpDown, ArrowUp, ArrowDown, Filter, ChevronDown, ChevronLeft, ChevronRight, Check, Image as ImageIcon,
-  Maximize2, RotateCcw, MousePointer2, Grab, Menu, PanelLeftClose, PanelLeftOpen
+  Maximize2, RotateCcw, MousePointer2, Grab, Menu, PanelLeftClose, PanelLeftOpen, Link2, Layers, FilterX
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { processDocuments, releerFilas } from "./lib/gemini";
@@ -65,10 +65,38 @@ interface BBox {
   xmax: number;
 }
 
-type MatchMethod = "DEFAULT" | "MANUAL" | "IA";
+// Cómo se resolvió el DNI de la fila. La distinción importa de cara a quien revisa:
+// AUTO es aritmética local (matching.ts) y se puede auditar sola; IA implica que hubo
+// una lectura de Gemini de por medio. Antes ambos casos se etiquetaban "IA", lo que
+// atribuía a un modelo coincidencias que en realidad calcula un algoritmo determinista.
+type MatchMethod =
+  | "DEFAULT"  // tal como salió de la extracción, sin vincular
+  | "MANUAL"   // una persona escribió o confirmó el DNI
+  | "AUTO"     // vinculado por el algoritmo de similitud local, sin IA
+  | "IA";      // releído por el modelo (relectura de renglón)
+
+// Estado de extracción de cada documento del lateral. Los proyectos son independientes:
+// cada uno se extrae por su cuenta y conserva su resultado aunque los demás cambien.
+type EstadoProyecto = "pendiente" | "procesando" | "listo" | "error";
+
+// Cómo se está mirando un proyecto: qué filas oculta y en qué orden las muestra. Se
+// guarda por proyecto, así que es parte de su estado y no de la aplicación.
+type OrdenVista = { key: string; direction: "asc" | "desc" } | null;
+type ColumnasFiltradas = { [key: string]: string[] };
+interface FiltrosVista {
+  texto: string;             // caja "Filtro..."
+  columnas: ColumnasFiltradas; // embudos de cada cabecera
+  soloErrores: boolean;      // interruptor "Sin Match"
+  orden: OrdenVista;
+}
+const FILTROS_VACIOS: FiltrosVista = { texto: "", columnas: {}, soloErrores: false, orden: null };
 
 interface ExtractedRow {
   id: string;
+  // Documento del que salió la fila, sellado en el momento de extraer. Es la única
+  // atribución fiable: el SourceFile que devuelve el modelo a veces es un nombre
+  // inventado ("page 2.jpeg") y emparejarlo a posteriori era pura heurística.
+  fileId: string;
   nro: string;
   nombre: string;
   dni: string;
@@ -90,6 +118,37 @@ interface MasterRow {
   cargo: string;
   area: string;
 }
+
+// Los dos métodos que la máquina decidió sola y llevan porcentaje de confianza. Se
+// agrupan aquí para que la insignia y el botón de "Aceptar altas" no se desincronicen
+// si mañana aparece un tercer método automático.
+const esVinculacionAutomatica = (row: ExtractedRow) =>
+  row.method === "AUTO" || row.method === "IA";
+
+// Insignia de método. Estaba duplicada palabra por palabra en la tabla y en las tarjetas
+// móviles, así que un cambio de criterio obligaba a tocar dos sitios y era fácil que uno
+// se quedara atrás.
+const methodBadge = (row: ExtractedRow): { label: string; className: string } => {
+  if (!esVinculacionAutomatica(row) || row.matchConfidence == null) {
+    return {
+      label: row.method,
+      className:
+        row.method === "MANUAL"
+          ? "bg-amber-100 text-amber-700 border-amber-200"
+          : "bg-slate-100 text-slate-600 border-slate-200",
+    };
+  }
+  const nivel = confidenceLevel(row.matchConfidence);
+  return {
+    label: `${row.method} ${Math.round(row.matchConfidence * 100)}%`,
+    className:
+      nivel === "high"
+        ? "bg-emerald-100 text-emerald-700 border-emerald-200"
+        : nivel === "medium"
+          ? "bg-amber-100 text-amber-700 border-amber-200"
+          : "bg-purple-100 text-purple-700 border-purple-200",
+  };
+};
 
 function parseCSVRow(row: string) {
   const result = [];
@@ -184,6 +243,12 @@ export default function App() {
   const [sheetsModal, setSheetsModal] = useState(false);
   const [idRefInput, setIdRefInput] = useState("");
 
+  // Confirmación del envío a Sheets. Va en un modal que hay que aceptar, no en el aviso
+  // que se desvanece solo: el envío es irreversible desde la app y no puede quedar duda
+  // de si llegó o no. Un toast de 3 segundos se pierde si miras a otro lado, y entonces
+  // la única forma de salir de dudas es ir a la hoja o reenviar y duplicar.
+  const [envioOk, setEnvioOk] = useState<{ cantidad: number; idRef: string; proyecto: string } | null>(null);
+
     // Enviar datos a Google Sheets
     const handleSendToSheets = async (IdRef: string) => {
       if (!IdRef.trim()) {
@@ -229,7 +294,11 @@ export default function App() {
           );
         }
         if (result.success) {
-          mostrarToast("ok", `${participantes.length} participante(s) enviado(s) a Google Sheets.`);
+          setEnvioOk({
+            cantidad: participantes.length,
+            idRef: IdRef.trim(),
+            proyecto: proyectoActivo ? nombreProyecto(proyectoActivo) : "todos los documentos",
+          });
         } else {
           mostrarToast("error", "Error al enviar: " + (result.message || "respuesta sin detalle."));
         }
@@ -239,6 +308,26 @@ export default function App() {
       setSending(false);
     };
   const [files, setFiles] = useState<DocumentFile[]>([]);
+  // Cada documento del lateral es un proyecto independiente. Con uno seleccionado, la
+  // tabla y TODO lo que sale de la app (copiar, CSV y Sheets) se limitan a sus filas:
+  // antes un envío a Sheets arrastraba los participantes de todos los documentos
+  // cargados, que es un error silencioso y caro de deshacer del lado de la hoja.
+  const [activeFileId, setActiveFileId] = useState<string | null>(null);
+
+  // Título que el usuario le pone a cada proyecto, solo para orientarse en el lateral
+  // cuando los archivos se llaman "B.pdf" y "C.pdf". Vive ÚNICAMENTE en memoria: no se
+  // persiste, no entra en el CSV ni viaja a Sheets, y se pierde al recargar. Si algún
+  // día hace falta que salga en una exportación, tendrá que ser una decisión explícita,
+  // no un efecto colateral de haber escrito algo en esta caja.
+  const [projectTitles, setProjectTitles] = useState<Record<string, string>>({});
+
+  // Estado de extracción por documento. Sin esto no había forma de saber qué proyecto ya
+  // se había procesado, y el botón relanzaba todos cada vez.
+  const [estadoProyectos, setEstadoProyectos] = useState<Record<string, EstadoProyecto>>({});
+  const estadoDe = (f: DocumentFile): EstadoProyecto => estadoProyectos[f.id] ?? "pendiente";
+
+  // Cómo nombrar un documento en pantalla: el título si lo hay, si no el nombre real.
+  const nombreProyecto = (f: DocumentFile) => projectTitles[f.id]?.trim() || f.name;
   const [status, setStatus] = useState<"idle" | "processing" | "success" | "error">("idle");
   const [extractedData, setExtractedData] = useState<ExtractedRow[]>([]);
   const [masterData, setMasterData] = useState<MasterRow[]>([]);
@@ -272,9 +361,40 @@ export default function App() {
   const [viewerDropdownOpen, setViewerDropdownOpen] = useState(false); // navegador de registros FUERA en el visor
   const [viewerError, setViewerError] = useState<string | null>(null); // aviso cuando no se puede abrir el documento
 
-  const [tableFilter, setTableFilter] = useState("");
-  const [sortConfig, setSortConfig] = useState<{ key: string, direction: 'asc' | 'desc' } | null>(null);
-  const [activeFilters, setActiveFilters] = useState<{ [key: string]: string[] }>({});
+  // Filtros y orden POR PROYECTO. Los proyectos son independientes también en esto: al
+  // cambiar de documento no se arrastra el filtro del anterior (que ocultaría filas sin
+  // motivo aparente) ni se pierde el que ya se tenía puesto al volver.
+  //
+  // La vista "todos los documentos" es un contexto más, con su propia clave, para que
+  // tampoco se pisen entre sí.
+  const CLAVE_TODOS = "__todos__";
+  const [filtrosPorProyecto, setFiltrosPorProyecto] = useState<Record<string, FiltrosVista>>({});
+  const claveFiltros = activeFileId ?? CLAVE_TODOS;
+  const filtros = filtrosPorProyecto[claveFiltros] ?? FILTROS_VACIOS;
+
+  // Escribe solo en el contexto actual. Los demás proyectos quedan intactos.
+  const aplicarFiltros = (patch: Partial<FiltrosVista>) =>
+    setFiltrosPorProyecto((prev) => ({
+      ...prev,
+      [claveFiltros]: { ...(prev[claveFiltros] ?? FILTROS_VACIOS), ...patch },
+    }));
+
+  // Alias con la forma de useState para no reescribir cada punto de uso de la tabla, y
+  // para que añadir un filtro nuevo siga siendo un cambio de una línea.
+  const tableFilter = filtros.texto;
+  const sortConfig = filtros.orden;
+  const activeFilters = filtros.columnas;
+  const showOnlyErrors = filtros.soloErrores;
+  const setTableFilter = (v: string) => aplicarFiltros({ texto: v });
+  const setShowOnlyErrors = (v: boolean) => aplicarFiltros({ soloErrores: v });
+  const setSortConfig = (v: OrdenVista | ((prev: OrdenVista) => OrdenVista)) =>
+    aplicarFiltros({ orden: typeof v === "function" ? v(filtros.orden) : v });
+  const setActiveFilters = (
+    v: ColumnasFiltradas | ((prev: ColumnasFiltradas) => ColumnasFiltradas)
+  ) => aplicarFiltros({ columnas: typeof v === "function" ? v(filtros.columnas) : v });
+
+  // Qué menú de embudo está abierto. Es estado de la interfaz, no un filtro: no pertenece
+  // al proyecto y se cierra al cambiar de contexto.
   const [openFilterMenu, setOpenFilterMenu] = useState<string | null>(null);
   
   // Avance de la carga de documentos (leer → rasterizar páginas → limpiar imagen).
@@ -288,7 +408,6 @@ export default function App() {
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => {
     try { return localStorage.getItem("sidebarCollapsed") === "1"; } catch { return false; }
   });
-  const [showOnlyErrors, setShowOnlyErrors] = useState(false);
   // Se guarda el id del registro, no su posición: la lista se filtra y se ordena en vivo.
   const [activeCandidateRow, setActiveCandidateRow] = useState<string | null>(null);
   const [editingRowId, setEditingRowId] = useState<string | null>(null);
@@ -353,6 +472,14 @@ export default function App() {
     };
   }, []);
 
+  // Al cambiar de proyecto se cierran los menús abiertos: pertenecen a la vista anterior
+  // y mostrarían los valores del documento equivocado.
+  useEffect(() => {
+    setOpenFilterMenu(null);
+    setActiveCandidateRow(null);
+    setEditingRowId(null);
+  }, [activeFileId]);
+
   // El aviso del visor se descarta solo.
   useEffect(() => {
     if (!viewerError) return;
@@ -364,10 +491,27 @@ export default function App() {
     resizingRef.current = { col, startX: clientX, startWidth: currentWidth };
   };
 
+  // Índice DNI → persona, construido una vez por carga de la maestra.
+  //
+  // Antes esto era un masterData.find() que normalizaba los 708 DNI de la lista en CADA
+  // consulta. getMasterInfo se llama por fila de la tabla, por contador de la cabecera y
+  // dentro de varios useMemo, así que un solo repintado disparaba cientos de miles de
+  // normalizaciones de texto. Ese era el coste que se notaba al navegar y el que hacía
+  // que cada paso de zoom (que repinta la app entera) tardara.
+  const masterIndex = useMemo(() => {
+    const idx = new Map<string, MasterRow>();
+    masterData.forEach((m: MasterRow) => {
+      const k = normalizeDniStrict(m.dni);
+      // El primero gana, igual que hacía find(), para no alterar resultados con duplicados.
+      if (k && !idx.has(k)) idx.set(k, m);
+    });
+    return idx;
+  }, [masterData]);
+
   const getMasterInfo = (dni: string) => {
     const normalized = normalizeDniStrict(dni);
     if (!normalized) return undefined;
-    return masterData.find((m: MasterRow) => normalizeDniStrict(m.dni) === normalized);
+    return masterIndex.get(normalized);
   };
 
   const handleFilesAdded = async (newFiles: FileList | null) => {
@@ -451,15 +595,21 @@ export default function App() {
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
-  const executeExtraction = async () => {
-    if (files.length === 0) return;
+  // Extrae UN proyecto. Antes mandaba todos los documentos cargados en una sola llamada
+  // y reemplazaba la tabla entera, así que añadir un documento nuevo obligaba a reprocesar
+  // (y volver a pagar) los que ya estaban resueltos, perdiendo además las correcciones
+  // manuales hechas sobre ellos.
+  const executeExtraction = async (target?: DocumentFile) => {
+    const objetivo = target ?? proyectoObjetivo;
+    if (!objetivo) return;
     setStatus("processing");
     setErrorMessage("");
-    setExtractedData([]);
+    setEstadoProyectos((prev) => ({ ...prev, [objetivo.id]: "procesando" }));
     try {
       // Se envían las páginas ya limpiadas. Etiquetar cada una con su número de página
       // además reduce que el modelo se invente el origen de cada fila.
-      const inputFormats = files.flatMap((f) => {
+      const inputFormats = (() => {
+        const f = objetivo;
         if (!f.ocrPages || f.ocrPages.length === 0) {
           return [{ data: f.base64, mimeType: f.mimeType, name: f.name }]; // por si el preprocesado falló
         }
@@ -469,7 +619,7 @@ export default function App() {
         return f.ocrPages.map((p, i) => ({
           data: p.base64, mimeType: p.mimeType, name: `${f.name} (página ${i + 1})`,
         }));
-      });
+      })();
       const result = await processDocuments(inputFormats);
       const rows = result.csv.split('\n').slice(1);
 
@@ -479,6 +629,7 @@ export default function App() {
         const cols = row.split(';');
         return {
           id: `r${rowIndex}_${Date.now()}`,
+          fileId: objetivo.id,
           nro: cols[0] || "", nombre: cols[1] || "", dni: cols[2] || "",
           ocupacion: cols[3] || "", area: cols[4] || "", sourceFile: cols[5]?.trim() || "",
           filaDoc: cols[6]?.trim() || "",
@@ -551,11 +702,22 @@ export default function App() {
       // dejarla detrás de un botón hacía que el panel se abriera con todo en FUERA
       // aunque los registros fueran perfectamente identificables.
       const { updated } = masterData.length > 0 ? vincularRegistros(parsed) : { updated: parsed };
-      setExtractedData(updated);
+      // Fusiona en lugar de reemplazar: los demás proyectos conservan sus filas y las
+      // correcciones manuales que ya se hicieran sobre ellas. Si este proyecto se vuelve
+      // a extraer, se sustituyen solo sus propias filas.
+      setExtractedData((prev: ExtractedRow[]) => [
+        ...prev.filter((r: ExtractedRow) => r.fileId !== objetivo.id),
+        ...updated,
+      ]);
+      setEstadoProyectos((prev) => ({ ...prev, [objetivo.id]: "listo" }));
+      // Se aísla lo recién extraído: es lo que se acaba de pedir, y deja la tabla y las
+      // exportaciones apuntando a ese proyecto sin tener que seleccionarlo a mano.
+      setActiveFileId(objetivo.id);
       setModelUsed(result.modelUsed);
       setStatus("success");
     } catch (err: any) {
       console.error("Extraction failed:", err);
+      setEstadoProyectos((prev) => ({ ...prev, [objetivo.id]: "error" }));
       setStatus("error");
       setErrorMessage(err.message || "Error en el procesamiento.");
     }
@@ -602,7 +764,7 @@ export default function App() {
 
       if (best.score >= UMBRAL_AUTO && margenSuficiente) {
         matchesFound++;
-        return { ...row, dni: best.master.dni, method: "IA" as MatchMethod, matchConfidence: best.score, matchCandidates: top3 };
+        return { ...row, dni: best.master.dni, method: "AUTO" as MatchMethod, matchConfidence: best.score, matchCandidates: top3 };
       }
       if (best.score >= UMBRAL_AUTO) ambiguas++;
       suggestionsFound++;
@@ -613,8 +775,11 @@ export default function App() {
   };
 
   const tryFuzzyMatch = () => {
-    const { updated, matchesFound, suggestionsFound, ambiguas } = vincularRegistros(extractedData);
-    setExtractedData(updated);
+    // Solo el proyecto a la vista: el botón vive en su barra y las cifras que reporta
+    // deben cuadrar con los contadores de la cabecera, que también son del proyecto.
+    const { updated, matchesFound, suggestionsFound, ambiguas } = vincularRegistros(datosDelProyecto);
+    const porId = new Map(updated.map((r: ExtractedRow) => [r.id, r]));
+    setExtractedData((prev: ExtractedRow[]) => prev.map((r: ExtractedRow) => porId.get(r.id) ?? r));
     if (matchesFound > 0 || suggestionsFound > 0) {
       const parts = [];
       if (matchesFound > 0) parts.push(`${matchesFound} coincidencias aplicadas`);
@@ -626,14 +791,18 @@ export default function App() {
     }
   };
 
+  // Solo el proyecto a la vista: el botón está en su barra y aparece según los contadores
+  // de ese proyecto, así que no puede dar por buenas coincidencias de otro que no se
+  // está revisando.
   const acceptAllHighConfidence = () => {
-    const updated = extractedData.map((row: ExtractedRow) => {
-      if (row.method === "IA" && row.matchConfidence != null && row.matchConfidence >= 0.92 && !getMasterInfo(row.dni)) {
+    const delProyecto = new Set(datosDelProyecto.map((r: ExtractedRow) => r.id));
+    setExtractedData((prev: ExtractedRow[]) => prev.map((row: ExtractedRow) => {
+      if (!delProyecto.has(row.id)) return row;
+      if (esVinculacionAutomatica(row) && row.matchConfidence != null && row.matchConfidence >= 0.92 && !getMasterInfo(row.dni)) {
         return { ...row, method: "MANUAL" as MatchMethod };
       }
       return row;
-    });
-    setExtractedData(updated);
+    }));
   };
 
   // --- Relectura puntual: el ÚLTIMO recurso, y el único gasto extra de IA -------------
@@ -648,10 +817,7 @@ export default function App() {
   // de lo que se busca.
   const MAX_RELECTURA = 12;
 
-  const filasSinCoincidencia = useMemo(
-    () => extractedData.filter((r: ExtractedRow) => !getMasterInfo(r.dni) && !!r.bbox),
-    [extractedData, masterData]
-  );
+  // (filasSinCoincidencia se declara junto a datosDelProyecto: depende del proyecto activo.)
 
   // Por debajo de este tamaño se manda la maestra COMPLETA. Prefiltrar tiene un riesgo
   // que no compensa: si el OCR leyó muy mal, la persona correcta se queda fuera del
@@ -700,13 +866,15 @@ export default function App() {
       // Agrupadas por página: cada recorte necesita la imagen de la que sale.
       const porPagina = new Map<string, ExtractedRow[]>();
       objetivo.forEach((r: ExtractedRow) => {
-        const key = `${r.sourceFile.toLowerCase()}||${r.pagina}`;
+        // Por documento real (fileId), no por el nombre que dijo el modelo: dos
+        // documentos distintos pueden traer el mismo SourceFile inventado.
+        const key = `${r.fileId}||${r.pagina}`;
         porPagina.set(key, [...(porPagina.get(key) || []), r]);
       });
 
       const recortes: RecorteFila[] = [];
       for (const filas of porPagina.values()) {
-        const file = findSourceFile(filas[0].sourceFile);
+        const file = documentoDeFila(filas[0]);
         if (!file) continue;
         const pages = pagesOf(file);
         const url = pages[resolvePageIdx(file, filas[0].sourceFile, filas[0].pagina)];
@@ -724,12 +892,15 @@ export default function App() {
       const { lecturas } = await releerFilas(recortes, construirCandidatos(objetivo));
       const porId = new Map(lecturas.map((l) => [l.id, l]));
 
-      const conLecturas = extractedData.map((row: ExtractedRow) => {
+      // Solo las filas de este proyecto: la re-vinculación posterior no debe reevaluar
+      // registros de otro documento, que podría rehacer un DNI corregido a mano allí.
+      const conLecturas = datosDelProyecto.map((row: ExtractedRow) => {
         const l = porId.get(row.id);
         if (!l) return row;
         const nuevoDni = (l.dni || "").replace(/\D/g, "");
         const nombre = l.nombre?.trim() || row.nombre;
         // Si la relectura cae sobre alguien de la maestra, es una resolución limpia.
+        // Único punto del programa donde "IA" es literal: el DNI lo leyó el modelo.
         if (nuevoDni && getMasterInfo(nuevoDni)) {
           return { ...row, dni: nuevoDni, nombre, method: "IA" as MatchMethod, matchConfidence: l.confianza };
         }
@@ -741,7 +912,8 @@ export default function App() {
       const { updated } = masterData.length > 0
         ? vincularRegistros(conLecturas)
         : { updated: conLecturas };
-      setExtractedData(updated);
+      const actualizadas = new Map(updated.map((r: ExtractedRow) => [r.id, r]));
+      setExtractedData((prev: ExtractedRow[]) => prev.map((r: ExtractedRow) => actualizadas.get(r.id) ?? r));
 
       const resueltas = updated.filter(
         (r: ExtractedRow) => porId.has(r.id) && !!getMasterInfo(r.dni)
@@ -780,8 +952,14 @@ export default function App() {
     return !isNaN(n) && n >= 1 ? n : null;
   };
 
-  // Resuelve el documento de origen de una fila tolerando que SourceFile no coincida
-  // exactamente con el nombre del archivo cargado.
+  // Documento del que salió una fila. El fileId sellado durante la extracción es
+  // autoritativo; findSourceFile queda solo como red de seguridad para filas que por
+  // cualquier motivo no lo lleven.
+  const documentoDeFila = (row: ExtractedRow): DocumentFile | undefined =>
+    files.find((f: DocumentFile) => f.id === row.fileId) ?? findSourceFile(row.sourceFile);
+
+  // Resuelve el documento de origen a partir del nombre, tolerando que SourceFile no
+  // coincida exactamente con el del archivo cargado.
   const findSourceFile = (filename: string): DocumentFile | undefined => {
     if (files.length === 0) return undefined;
     // Con un único documento cargado no hay ambigüedad posible: la fila sale de ese.
@@ -810,8 +988,10 @@ export default function App() {
     return Math.min(Math.max(0, pageNum - 1), total - 1);
   };
 
-  const openViewer = (filename: string, pagina: string, bbox: BBox | null, fila: string, rowId: string | null) => {
-    const file = findSourceFile(filename);
+  // `docConocido` llega cuando la fila trae su fileId: evita volver a adivinar el
+  // documento por el nombre que devolvió el modelo.
+  const openViewer = (filename: string, pagina: string, bbox: BBox | null, fila: string, rowId: string | null, docConocido?: DocumentFile) => {
+    const file = docConocido ?? findSourceFile(filename);
     // Nunca fallar en silencio: el botón "ojo" siempre debe responder algo.
     if (!file) {
       setViewerError(
@@ -828,7 +1008,7 @@ export default function App() {
     }
     const safeIdx = resolvePageIdx(file, filename, pagina);
     setViewingImage({ url: pages[safeIdx], name: file.name, bbox, fila, pagina: String(safeIdx + 1), totalPages: pages.length, rowId });
-    setZoomLevel(1); setPanOffset({ x: 0, y: 0 }); setBboxNudge(0);
+    fijarVista({ zoom: 1, pan: { x: 0, y: 0 } }, true); setBboxNudge(0);
     setViewerError(null);
   };
 
@@ -836,11 +1016,11 @@ export default function App() {
   // Primero muestra la marca aproximada (IA) y luego la refina detectando el grid real.
   const handleViewRow = async (row: ExtractedRow) => {
     setViewerQuery(row.nombre || row.dni || "");
-    openViewer(row.sourceFile, row.pagina, row.bbox, row.filaDoc, row.id);
+    const file = documentoDeFila(row);
+    openViewer(row.sourceFile, row.pagina, row.bbox, row.filaDoc, row.id, file);
 
     const fila = parseInt(row.filaDoc, 10);
     if (isNaN(fila) || fila < 1) return;
-    const file = findSourceFile(row.sourceFile);
     if (!file) return;
     const pages = pagesOf(file);
     if (pages.length === 0) return;
@@ -898,15 +1078,68 @@ export default function App() {
     openViewer(filename, "1", null, "", null);
   };
 
+  // --- Vista del visor (zoom + desplazamiento) --------------------------------------
+  //
+  // Los eventos de rueda y de arrastre llegan muy por encima de la frecuencia a la que
+  // el navegador pinta, y cada setState repinta la app entera (tabla incluida). Antes
+  // eso significaba varios renders completos por fotograma. Ahora los refs son la fuente
+  // de verdad inmediata —para poder encadenar deltas sin esperar al repintado— y el
+  // estado de React se sincroniza una sola vez por fotograma.
+  const zoomTargetRef = useRef(1);
+  const panTargetRef = useRef({ x: 0, y: 0 });
+  const rafVistaRef = useRef<number | null>(null);
+
+  // Un gesto se considera en curso mientras llegan eventos y hasta poco después del
+  // último. Solo decide si la capa se mantiene en GPU: durante el gesto interesa la
+  // fluidez, y al acabar interesa que el navegador vuelva a rasterizar nítido.
+  const [gestoActivo, setGestoActivo] = useState(false);
+  const finGestoRef = useRef<number | null>(null);
+  const marcarGesto = useCallback(() => {
+    setGestoActivo(true);
+    if (finGestoRef.current !== null) clearTimeout(finGestoRef.current);
+    finGestoRef.current = window.setTimeout(() => setGestoActivo(false), 180);
+  }, []);
+
+  const fijarVista = useCallback(
+    (v: { zoom?: number; pan?: { x: number; y: number } }, inmediato = false) => {
+      if (v.zoom !== undefined) zoomTargetRef.current = Math.min(Math.max(v.zoom, 0.5), 15);
+      if (v.pan) panTargetRef.current = v.pan;
+      if (inmediato) {
+        if (rafVistaRef.current !== null) {
+          cancelAnimationFrame(rafVistaRef.current);
+          rafVistaRef.current = null;
+        }
+        setZoomLevel(zoomTargetRef.current);
+        setPanOffset(panTargetRef.current);
+        return;
+      }
+      // Solo la vía agrupada cuenta como gesto: las acciones puntuales (botones, reset)
+      // deben quedar nítidas de inmediato, sin pasar por la capa de GPU.
+      marcarGesto();
+      if (rafVistaRef.current !== null) return;
+      rafVistaRef.current = requestAnimationFrame(() => {
+        rafVistaRef.current = null;
+        setZoomLevel(zoomTargetRef.current);
+        setPanOffset(panTargetRef.current);
+      });
+    },
+    [marcarGesto]
+  );
+
+  useEffect(() => () => {
+    if (rafVistaRef.current !== null) cancelAnimationFrame(rafVistaRef.current);
+    if (finGestoRef.current !== null) clearTimeout(finGestoRef.current);
+  }, []);
+
   // Advanced Viewer Handlers
   const handlePanStart = (e: React.MouseEvent) => {
     setIsPanning(true);
-    panStartRef.current = { x: e.clientX - panOffset.x, y: e.clientY - panOffset.y };
+    panStartRef.current = { x: e.clientX - panTargetRef.current.x, y: e.clientY - panTargetRef.current.y };
   };
   const handlePanMove = useCallback((e: React.MouseEvent) => {
     if (!isPanning) return;
-    setPanOffset({ x: e.clientX - panStartRef.current.x, y: e.clientY - panStartRef.current.y });
-  }, [isPanning]);
+    fijarVista({ pan: { x: e.clientX - panStartRef.current.x, y: e.clientY - panStartRef.current.y } });
+  }, [isPanning, fijarVista]);
   const handlePanEnd = () => setIsPanning(false);
 
   // Touch Gestures State
@@ -916,28 +1149,28 @@ export default function App() {
   const handleTouchStart = (e: React.TouchEvent) => {
     if (e.touches.length === 1) {
       setIsPanning(true);
-      panStartRef.current = { x: e.touches[0].clientX - panOffset.x, y: e.touches[0].clientY - panOffset.y };
+      panStartRef.current = { x: e.touches[0].clientX - panTargetRef.current.x, y: e.touches[0].clientY - panTargetRef.current.y };
       touchStartDistRef.current = null;
     } else if (e.touches.length === 2) {
       setIsPanning(false);
       const dx = e.touches[0].clientX - e.touches[1].clientX;
       const dy = e.touches[0].clientY - e.touches[1].clientY;
       touchStartDistRef.current = Math.hypot(dx, dy);
-      touchStartZoomRef.current = zoomLevel;
+      touchStartZoomRef.current = zoomTargetRef.current;
     }
   };
-  
+
   const handleTouchMove = useCallback((e: React.TouchEvent) => {
     if (e.touches.length === 1 && isPanning) {
-      setPanOffset({ x: e.touches[0].clientX - panStartRef.current.x, y: e.touches[0].clientY - panStartRef.current.y });
+      fijarVista({ pan: { x: e.touches[0].clientX - panStartRef.current.x, y: e.touches[0].clientY - panStartRef.current.y } });
     } else if (e.touches.length === 2 && touchStartDistRef.current !== null) {
       const dx = e.touches[0].clientX - e.touches[1].clientX;
       const dy = e.touches[0].clientY - e.touches[1].clientY;
       const currentDist = Math.hypot(dx, dy);
       const scale = currentDist / touchStartDistRef.current;
-      setZoomLevel(Math.min(Math.max(touchStartZoomRef.current * scale, 0.5), 15));
+      fijarVista({ zoom: touchStartZoomRef.current * scale });
     }
-  }, [isPanning, zoomLevel]);
+  }, [isPanning, fijarVista]);
 
   const handleTouchEnd = () => {
     setIsPanning(false);
@@ -945,25 +1178,64 @@ export default function App() {
   };
 
   const handleWheel = (e: React.WheelEvent) => {
-    if (e.ctrlKey || e.metaKey || true) { // Always allow wheel zoom for better UX
-      e.preventDefault();
-      const delta = -e.deltaY;
-      const factor = 1.1;
-      setZoomLevel(prev => {
-        const next = delta > 0 ? prev * factor : prev / factor;
-        return Math.min(Math.max(next, 0.5), 15);
-      });
-    }
+    e.preventDefault();
+    // Se parte del ref, no del estado: en una ráfaga de rueda el estado todavía va por
+    // el fotograma anterior y los pasos se perderían unos a otros.
+    const factor = 1.1;
+    const actual = zoomTargetRef.current;
+    fijarVista({ zoom: -e.deltaY > 0 ? actual * factor : actual / factor });
   };
 
   const resetViewer = () => {
-    setZoomLevel(1);
-    setPanOffset({ x: 0, y: 0 });
+    fijarVista({ zoom: 1, pan: { x: 0, y: 0 } }, true);
   };
 
+  // Filas del proyecto activo. Es la base común de los contadores de la cabecera, de la
+  // tabla y de las exportaciones, para que las tres cuenten siempre lo mismo.
+  //
+  // El filtro es una comparación directa de fileId, sellado al extraer. Antes se deducía
+  // emparejando de forma difusa el SourceFile devuelto por el modelo con los nombres de
+  // los archivos cargados, y ese emparejamiento podía fallar en silencio.
+  const datosDelProyecto = useMemo(
+    () => (activeFileId ? extractedData.filter((r: ExtractedRow) => r.fileId === activeFileId) : extractedData),
+    [extractedData, activeFileId]
+  );
+
+  const proyectoActivo = files.find((f: DocumentFile) => f.id === activeFileId);
+
+  // Sobre qué documento actúa "Iniciar Extracción". Con un solo documento cargado no hay
+  // ambigüedad y no se obliga a seleccionarlo antes; con varios hay que elegir, porque
+  // adivinar cuál se quiere procesar es justo lo que hacía mal antes.
+  const proyectoObjetivo = proyectoActivo ?? (files.length === 1 ? files[0] : undefined);
+  const estadoObjetivo = proyectoObjetivo ? estadoDe(proyectoObjetivo) : null;
+
+  // Contadores de la cabecera en una sola pasada. Estaban escritos como seis .filter()
+  // independientes sobre la misma lista, todos ellos consultando la maestra: seis
+  // recorridos completos en cada repintado, incluidos los de un gesto de zoom.
+  const resumenProyecto = useMemo(() => {
+    let sinMatch = 0, conSugerencia = 0, hayAltaConfianza = false;
+    datosDelProyecto.forEach((r: ExtractedRow) => {
+      if (!getMasterInfo(r.dni)) {
+        sinMatch++;
+        if (r.matchCandidates && r.matchCandidates.length > 0) conSugerencia++;
+      }
+      if (esVinculacionAutomatica(r) && r.matchConfidence != null && r.matchConfidence >= 0.92) {
+        hayAltaConfianza = true;
+      }
+    });
+    return { total: datosDelProyecto.length, sinMatch, conSugerencia, hayAltaConfianza };
+  }, [datosDelProyecto, masterIndex]);
+
+  // Acotada al proyecto activo igual que la tabla: la relectura es la operación que
+  // gasta IA, así que no puede tocar renglones de un documento que no estás mirando.
+  const filasSinCoincidencia = useMemo(
+    () => datosDelProyecto.filter((r: ExtractedRow) => !getMasterInfo(r.dni) && !!r.bbox),
+    [datosDelProyecto, masterData]
+  );
+
   const displayedData = useMemo(() => {
-    let result = [...extractedData];
-    
+    let result = [...datosDelProyecto];
+
     if (showOnlyErrors) {
       result = result.filter((r: ExtractedRow) => !getMasterInfo(r.dni) || r.id === editingRowId);
     }
@@ -1003,7 +1275,30 @@ export default function App() {
       });
     }
     return result;
-  }, [extractedData, tableFilter, sortConfig, activeFilters, showOnlyErrors, masterData, editingRowId]);
+  }, [datosDelProyecto, tableFilter, sortConfig, activeFilters, showOnlyErrors, masterData, editingRowId]);
+
+  // Filtros puestos ahora mismo sobre el proyecto. Se cuentan para dos cosas: no enseñar
+  // el botón de limpiar cuando no hay nada que limpiar, y decir cuántos se van a quitar.
+  //
+  // Los filtros por columna son los más fáciles de olvidar: se ponen desde un embudo del
+  // encabezado y, una vez cerrado el menú, la única pista de que siguen activos es un
+  // icono teñido. Ver "Total: 106" y una tabla con 3 filas sin saber por qué es el
+  // problema que resuelve esto.
+  const filtrosActivos = useMemo(() => {
+    let n = 0;
+    if (tableFilter.trim()) n++;
+    if (showOnlyErrors) n++;
+    n += Object.keys(activeFilters).filter((k: string) => activeFilters[k].length > 0).length;
+    return n;
+  }, [tableFilter, showOnlyErrors, activeFilters]);
+
+  // Limpia solo el contexto actual: los filtros de los demás proyectos siguen donde
+  // estaban. No toca la selección de proyecto (no es un filtro de la vista, es el
+  // proyecto) ni el orden, que reordena pero no oculta nada.
+  const limpiarFiltros = () => {
+    aplicarFiltros({ texto: "", columnas: {}, soloErrores: false });
+    setOpenFilterMenu(null);
+  };
 
   const toggleSort = (key: string) => setSortConfig((prev: { key: string, direction: 'asc' | 'desc' } | null) => (prev?.key === key && prev.direction === 'asc') ? { key, direction: 'desc' } : { key, direction: 'asc' });
   const toggleFilterValue = (column: string, value: string) => setActiveFilters((prev: { [key: string]: string[] }) => {
@@ -1014,7 +1309,9 @@ export default function App() {
 
   const getUniqueValues = (column: string): string[] => {
     if (column === "estado") return ["OK", "FUERA"];
-    const values = extractedData.map((r: ExtractedRow) => r[column as keyof ExtractedRow] as string);
+    // Los desplegables de filtro solo ofrecen valores del proyecto a la vista: si no,
+    // aparecerían opciones de otro documento que nunca devuelven ninguna fila.
+    const values = datosDelProyecto.map((r: ExtractedRow) => r[column as keyof ExtractedRow] as string);
     return Array.from(new Set(values)).filter((v): v is string => !!v).sort();
   };
 
@@ -1031,9 +1328,11 @@ export default function App() {
   // Cola de revisión del visor: los registros sin match, en el orden del documento.
   // Se incluye el que se está viendo aunque ya lo hayas resuelto, para que no se salga
   // de la lista bajo los pies al corregir su DNI y siga habiendo un "siguiente".
+  // Acotada al proyecto activo: con un documento aislado, "siguiente" no debe saltar a
+  // un renglón de otro documento que ni siquiera está en la tabla.
   const viewerQueue = useMemo(
-    () => extractedData.filter((r) => !getMasterInfo(r.dni) || r.id === viewingImage?.rowId),
-    [extractedData, masterData, viewingImage?.rowId]
+    () => datosDelProyecto.filter((r) => !getMasterInfo(r.dni) || r.id === viewingImage?.rowId),
+    [datosDelProyecto, masterData, viewingImage?.rowId]
   );
   const viewerQueueIdx = viewingRow ? viewerQueue.findIndex((r) => r.id === viewingRow.id) : -1;
   const goToQueue = (delta: number) => {
@@ -1126,17 +1425,83 @@ export default function App() {
           </AnimatePresence>
 
           <div className="space-y-3">
-            {files.map((f) => (
-              <div key={f.id} onDoubleClick={() => handleViewSource(f.name)} className="group relative flex items-center p-3 rounded-xl border border-slate-200 bg-white shadow-sm hover:shadow-md transition-shadow cursor-pointer select-none">
-                <div className="h-10 w-10 flex-shrink-0 bg-slate-100 rounded-lg flex items-center justify-center overflow-hidden border border-slate-200 text-slate-500">
+            {files.map((f) => {
+              const seleccionado = f.id === activeFileId;
+              const nFilas = extractedData.filter((r: ExtractedRow) => r.fileId === f.id).length;
+              const estado = estadoDe(f);
+              return (
+              <div
+                key={f.id}
+                // Un clic aísla el proyecto; volver a hacer clic en el mismo vuelve a
+                // mostrarlos todos, así que no hace falta un botón de "quitar filtro".
+                onClick={() => setActiveFileId(seleccionado ? null : f.id)}
+                onDoubleClick={() => handleViewSource(f.name)}
+                title={seleccionado ? "Clic para volver a ver todos los documentos" : `Ver solo los datos de ${nombreProyecto(f)}`}
+                className={`group relative flex items-center p-3 rounded-xl border shadow-sm hover:shadow-md transition-all cursor-pointer select-none ${
+                  seleccionado ? "border-blue-500 bg-blue-50 ring-2 ring-blue-500/30" : "border-slate-200 bg-white"
+                }`}
+              >
+                <div className={`h-10 w-10 flex-shrink-0 rounded-lg flex items-center justify-center overflow-hidden border ${seleccionado ? "border-blue-300 bg-blue-100 text-blue-600" : "border-slate-200 bg-slate-100 text-slate-500"}`}>
                   {f.previewUrl ? <img src={f.previewUrl} alt="" className="object-cover w-full h-full" /> : <FileText size={20} />}
                 </div>
                 <div className="ml-3 flex-1 min-w-0 pr-8">
-                  <p className="text-sm font-medium text-slate-800 truncate">{f.name}</p>
+                  {/* stopPropagation en todo: sin él, escribir dentro de la caja
+                      seleccionaría y deseleccionaría el proyecto con cada clic. */}
+                  <input
+                    value={projectTitles[f.id] ?? ""}
+                    onChange={(e) => setProjectTitles(prev => ({ ...prev, [f.id]: e.target.value }))}
+                    onClick={(e) => e.stopPropagation()}
+                    onDoubleClick={(e) => e.stopPropagation()}
+                    onKeyDown={(e) => { e.stopPropagation(); if (e.key === "Enter" || e.key === "Escape") e.currentTarget.blur(); }}
+                    placeholder="Escribe un título…"
+                    maxLength={60}
+                    title="Título solo para identificarlo aquí: no se guarda ni se envía a Sheets"
+                    className={`w-full bg-transparent text-sm font-semibold outline-none truncate rounded px-1 -ml-1 border border-transparent transition-colors placeholder:font-normal placeholder:italic ${
+                      seleccionado
+                        ? "text-blue-900 placeholder:text-blue-400/70 hover:border-blue-300 focus:border-blue-500 focus:bg-white"
+                        : "text-slate-800 placeholder:text-slate-400 hover:border-slate-300 focus:border-blue-500 focus:bg-white"
+                    }`}
+                  />
+                  <p className={`text-[10px] truncate ${seleccionado ? "text-blue-600" : "text-slate-400"}`}>
+                    <span className="font-mono">{f.name}</span>
+                    {estado === "listo" && <span className="font-semibold"> · {nFilas} fila(s)</span>}
+                  </p>
+                  {/* El estado va en la tarjeta, no solo en el botón: con varios proyectos
+                      hay que poder ver de un vistazo cuál falta por procesar. */}
+                  <span className={`inline-flex items-center gap-1 mt-1 px-1.5 py-0.5 rounded text-[9px] font-bold border ${
+                    estado === "listo" ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                      : estado === "procesando" ? "bg-blue-50 text-blue-700 border-blue-200"
+                      : estado === "error" ? "bg-red-50 text-red-700 border-red-200"
+                      : "bg-slate-100 text-slate-500 border-slate-200"
+                  }`}>
+                    {estado === "listo" ? <><Check size={9} /> Extraído</>
+                      : estado === "procesando" ? <><Loader2 size={9} className="animate-spin" /> Extrayendo…</>
+                      : estado === "error" ? <><AlertCircle size={9} /> Falló</>
+                      : "Sin extraer"}
+                  </span>
                 </div>
-                <button onClick={(e) => { e.stopPropagation(); setFiles(prev => prev.filter(x => x.id !== f.id)); }} className="absolute right-3 p-2 rounded-full text-slate-400 hover:text-red-500 hover:bg-red-50 opacity-0 group-hover:opacity-100 transition-all"><X size={16} /></button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    // Quitar el documento se lleva su extracción: son proyectos
+                    // independientes, y dejar filas huérfanas de un archivo que ya no
+                    // está las volvería inexportables y sin forma de abrir su origen.
+                    // Se avisa solo si hay algo que perder.
+                    if (nFilas > 0 && !confirm(`¿Quitar ${nombreProyecto(f)}?\n\nSe eliminarán también sus ${nFilas} fila(s) extraída(s). Los demás proyectos no se tocan.`)) return;
+                    if (activeFileId === f.id) setActiveFileId(null);
+                    setExtractedData(prev => prev.filter((r: ExtractedRow) => r.fileId !== f.id));
+                    // El título y el estado mueren con el documento: si no, un archivo
+                    // nuevo podría heredarlos en caso de repetirse el id.
+                    setProjectTitles(prev => { const { [f.id]: _, ...resto } = prev; return resto; });
+                    setEstadoProyectos(prev => { const { [f.id]: _, ...resto } = prev; return resto; });
+                    setFiltrosPorProyecto(prev => { const { [f.id]: _, ...resto } = prev; return resto; });
+                    setFiles(prev => prev.filter(x => x.id !== f.id));
+                  }}
+                  className="absolute right-3 p-2 rounded-full text-slate-400 hover:text-red-500 hover:bg-red-50 opacity-0 group-hover:opacity-100 transition-all"
+                ><X size={16} /></button>
               </div>
-            ))}
+              );
+            })}
           </div>
         </div>
         <div className="p-6 border-t border-slate-200 bg-white">
@@ -1168,12 +1533,53 @@ export default function App() {
               )}
             </div>
           )}
-          {/* Se bloquea mientras se cargan documentos: aún no están en `files` y se
-              extraería con la lista incompleta. */}
-          <button disabled={files.length === 0 || status === "processing" || isApiKeyMissing || !!uploadProgress} onClick={executeExtraction} className="w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-200 disabled:text-slate-400 text-white shadow-sm font-semibold rounded-xl py-3.5 transition-all text-sm">
-            {status === "processing" || uploadProgress ? <Loader2 size={18} className="animate-spin" /> : <Play size={18} fill="currentColor" />}
-            {uploadProgress ? "Cargando documentos…" : "Iniciar Extracción"}
-          </button>
+          {/* El botón actúa sobre UN proyecto: el seleccionado, o el único cargado. Se
+              bloquea mientras se cargan documentos (aún no están en `files`) y también
+              cuando el proyecto ya está extraído, para no repetir el gasto de una
+              extracción que ya se pagó. */}
+          {(() => {
+            const cargando = !!uploadProgress;
+            const ocupado = status === "processing" || estadoObjetivo === "procesando";
+            const yaExtraido = estadoObjetivo === "listo";
+            const bloqueado = files.length === 0 || !proyectoObjetivo || ocupado || yaExtraido || isApiKeyMissing || cargando;
+
+            const etiqueta = cargando ? "Cargando documentos…"
+              : ocupado ? "Extrayendo…"
+              : files.length === 0 ? "Iniciar Extracción"
+              : !proyectoObjetivo ? "Elige un proyecto en la lista"
+              : yaExtraido ? "Proyecto ya extraído"
+              : estadoObjetivo === "error" ? `Reintentar ${nombreProyecto(proyectoObjetivo)}`
+              : `Extraer ${nombreProyecto(proyectoObjetivo)}`;
+
+            return (
+              <>
+                <button
+                  disabled={bloqueado}
+                  onClick={() => executeExtraction()}
+                  title={proyectoObjetivo ? `Se procesará únicamente ${proyectoObjetivo.name}` : "Selecciona un documento en la lista para extraerlo"}
+                  className="w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-200 disabled:text-slate-400 text-white shadow-sm font-semibold rounded-xl py-3.5 transition-all text-sm"
+                >
+                  {ocupado || cargando ? <Loader2 size={18} className="animate-spin" /> : <Play size={18} fill="currentColor" />}
+                  <span className="truncate">{etiqueta}</span>
+                </button>
+                {/* Volver a extraer sigue siendo posible, pero deja de ser el camino por
+                    defecto: hay que pedirlo, porque cuesta una llamada al modelo y
+                    descarta las correcciones manuales de ese proyecto. */}
+                {yaExtraido && !ocupado && (
+                  <button
+                    onClick={() => {
+                      if (confirm(`¿Volver a extraer ${nombreProyecto(proyectoObjetivo!)}?\n\nSe descartarán sus filas actuales y las correcciones hechas sobre ellas. Los demás proyectos no se tocan.`)) {
+                        executeExtraction(proyectoObjetivo);
+                      }
+                    }}
+                    className="w-full mt-2 text-[11px] font-semibold text-slate-500 hover:text-blue-600 transition-colors"
+                  >
+                    Volver a extraer este proyecto
+                  </button>
+                )}
+              </>
+            );
+          })()}
         </div>
         </div>
       </aside>
@@ -1208,47 +1614,65 @@ export default function App() {
                 </button>
               )}
               Panel de Resultados
-              {extractedData.length > 0 && (
+              {/* Con un proyecto aislado, esta pastilla es la única señal en la zona
+                  derecha de que lo que se ve —y lo que se exporta— no es todo. */}
+              {proyectoActivo && (
+                <button
+                  onClick={() => setActiveFileId(null)}
+                  title="Quitar el filtro y volver a ver todos los documentos"
+                  className="flex items-center gap-1.5 text-xs font-bold bg-blue-100 text-blue-700 border border-blue-300 px-2.5 py-1 rounded-full hover:bg-blue-200 transition-colors max-w-[16rem]"
+                >
+                  <Layers size={12} className="shrink-0" />
+                  <span className="truncate">{nombreProyecto(proyectoActivo)}</span>
+                  <X size={12} className="shrink-0" />
+                </button>
+              )}
+              {resumenProyecto.total > 0 && (
                 <div className="flex items-center gap-2">
-                  <span className="text-xs font-bold bg-slate-100 text-slate-600 px-2.5 py-1 rounded-full">Total: {extractedData.length}</span>
-                  {extractedData.filter(r => !getMasterInfo(r.dni)).length > 0 && (
+                  <span className="text-xs font-bold bg-slate-100 text-slate-600 px-2.5 py-1 rounded-full">Total: {resumenProyecto.total}</span>
+                  {resumenProyecto.sinMatch > 0 && (
                     <button
                       onClick={() => setShowOnlyErrors(!showOnlyErrors)}
                       className={`text-xs font-bold px-2.5 py-1 rounded-full border transition-colors ${showOnlyErrors ? 'bg-red-600 text-white border-red-700' : 'bg-red-100 text-red-600 border-red-200 hover:bg-red-200'}`}
                     >
-                      ⚠️ Sin Match: {extractedData.filter(r => !getMasterInfo(r.dni)).length}
+                      ⚠️ Sin Match: {resumenProyecto.sinMatch}
                     </button>
                   )}
-                  {extractedData.filter(r => !getMasterInfo(r.dni) && r.matchCandidates && r.matchCandidates.length > 0).length > 0 && (
+                  {resumenProyecto.conSugerencia > 0 && (
                     <span className="text-xs font-bold bg-amber-100 text-amber-700 px-2.5 py-1 rounded-full border border-amber-200">
-                      💡 Sugerencias: {extractedData.filter(r => !getMasterInfo(r.dni) && r.matchCandidates && r.matchCandidates.length > 0).length}
+                      💡 Sugerencias: {resumenProyecto.conSugerencia}
                     </span>
                   )}
                 </div>
               )}
             </h2>
             <div className="md:hidden flex items-center gap-2">
-              <span className="font-semibold text-slate-700 text-sm">Resultados</span>
-              {extractedData.length > 0 && (
+              <span className="font-semibold text-slate-700 text-sm truncate max-w-[9rem]">{proyectoActivo ? nombreProyecto(proyectoActivo) : "Resultados"}</span>
+              {proyectoActivo && (
+                <button onClick={() => setActiveFileId(null)} title="Ver todos los documentos" className="p-1 rounded-full bg-blue-100 text-blue-700 border border-blue-300">
+                  <X size={10} />
+                </button>
+              )}
+              {resumenProyecto.total > 0 && (
                 <div className="flex items-center gap-1.5">
-                  <span className="text-[10px] font-bold bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full">{extractedData.length}</span>
-                  {extractedData.filter(r => !getMasterInfo(r.dni)).length > 0 && (
-                    <button 
+                  <span className="text-[10px] font-bold bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full">{resumenProyecto.total}</span>
+                  {resumenProyecto.sinMatch > 0 && (
+                    <button
                       onClick={() => setShowOnlyErrors(!showOnlyErrors)}
                       className={`text-[10px] font-bold px-2 py-0.5 rounded-full border transition-colors ${showOnlyErrors ? 'bg-red-600 text-white border-red-700' : 'bg-red-100 text-red-600 border-red-200'}`}
                     >
-                      {extractedData.filter(r => !getMasterInfo(r.dni)).length} ⚠️
+                      {resumenProyecto.sinMatch} ⚠️
                     </button>
                   )}
                 </div>
               )}
             </div>
-            {extractedData.length > 0 && (
+            {resumenProyecto.total > 0 && (
               <div className="flex flex-wrap items-center gap-2">
-                <button onClick={tryFuzzyMatch} title="Vincula los registros con la lista maestra por nombre y DNI" className="flex items-center gap-2 px-3 py-2 text-[10px] md:text-xs font-bold text-white bg-gradient-to-r from-blue-600 to-indigo-600 rounded-full hover:from-blue-700 hover:to-indigo-700 transition-all shadow-md active:scale-95 whitespace-nowrap">
-                  <Sparkles size={14} /> <span className="hidden md:inline">Vincular</span><span className="md:hidden">IA Link</span>
+                <button onClick={tryFuzzyMatch} title="Vincula los registros con la lista maestra comparando nombre y DNI (cálculo local, no usa IA)" className="flex items-center gap-2 px-3 py-2 text-[10px] md:text-xs font-bold text-white bg-gradient-to-r from-blue-600 to-indigo-600 rounded-full hover:from-blue-700 hover:to-indigo-700 transition-all shadow-md active:scale-95 whitespace-nowrap">
+                  <Link2 size={14} /> <span className="hidden md:inline">Vincular</span><span className="md:hidden">Vincular</span>
                 </button>
-                {extractedData.some(r => r.method === "IA" && r.matchConfidence != null && r.matchConfidence >= 0.92) && (
+                {resumenProyecto.hayAltaConfianza && (
                   <button onClick={acceptAllHighConfidence} title="Da por buenas todas las coincidencias con confianza alta (≥92%)" className="flex items-center gap-1.5 px-3 py-2 text-[10px] md:text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-full transition-all shadow-md active:scale-95 whitespace-nowrap">
                     <Check size={14} /> <span className="hidden md:inline">Aceptar altas</span><span className="md:hidden">✓ AC</span>
                   </button>
@@ -1271,10 +1695,24 @@ export default function App() {
                     <span className="md:hidden">{Math.min(filasSinCoincidencia.length, MAX_RELECTURA)}🔍</span>
                   </button>
                 )}
+                {/* Solo aparece si hay algo que limpiar, y dice cuántos filtros quita.
+                    Los de columna se ponen desde un embudo del encabezado y, con el menú
+                    cerrado, la única pista de que siguen puestos es un icono teñido. */}
+                {filtrosActivos > 0 && (
+                  <button
+                    onClick={limpiarFiltros}
+                    title={`Quita los ${filtrosActivos} filtro(s) puestos en este proyecto. No afecta a los demás proyectos ni borra ningún dato.`}
+                    className="flex items-center gap-1.5 px-3 py-2 text-[10px] md:text-xs font-bold text-slate-600 bg-white border border-slate-300 hover:bg-slate-50 hover:text-slate-800 rounded-full transition-all shadow-sm active:scale-95 whitespace-nowrap"
+                  >
+                    <FilterX size={14} />
+                    <span className="hidden md:inline">Limpiar filtros ({filtrosActivos})</span>
+                    <span className="md:hidden">{filtrosActivos}</span>
+                  </button>
+                )}
               </div>
             )}
           </div>
-          {extractedData.length > 0 && (
+          {datosDelProyecto.length > 0 && (
             <div className="flex flex-wrap items-center gap-2 w-full lg:w-auto">
               {/* El filtro cede ancho antes que los botones: es el único control que
                   sigue siendo usable estrecho, así que absorbe él la falta de espacio. */}
@@ -1301,7 +1739,12 @@ export default function App() {
                 const blob = new Blob([getCsvString()], { type: "text/csv;charset=utf-8;" });
                 const url = URL.createObjectURL(blob);
                 const link = document.createElement("a");
-                link.href = url; link.setAttribute("download", "participantes.csv");
+                // El nombre lleva el proyecto: descargar dos documentos seguidos dejaba
+                // dos "participantes.csv" indistinguibles en la carpeta de descargas.
+                const nombreCsv = proyectoActivo
+                  ? `participantes-${fileStem(proyectoActivo.name).replace(/[^a-z0-9]+/gi, "-")}.csv`
+                  : "participantes.csv";
+                link.href = url; link.setAttribute("download", nombreCsv);
                 // Algunos navegadores ignoran el click si el enlace no está en el DOM.
                 document.body.appendChild(link);
                 link.click();
@@ -1341,14 +1784,47 @@ export default function App() {
             </motion.div>
           )}
 
-          {extractedData.length > 0 && (
+          {/* Proyecto seleccionado y sin filas. Con proyectos independientes el caso
+              normal es que aún no se haya extraído, así que el panel dice qué falta
+              hacer en vez de dejar un hueco en blanco. */}
+          {proyectoActivo && datosDelProyecto.length === 0 && status !== "processing" && (
+            <div className="w-full flex flex-col items-center justify-center py-16 gap-3 text-slate-400">
+              <Layers size={28} className="opacity-40" />
+              <p className="text-sm font-semibold text-slate-600">{nombreProyecto(proyectoActivo)}</p>
+              {estadoDe(proyectoActivo) === "listo" ? (
+                <p className="text-xs max-w-xs text-center">
+                  La extracción terminó sin devolver ninguna fila para este documento.
+                </p>
+              ) : estadoDe(proyectoActivo) === "error" ? (
+                <p className="text-xs max-w-xs text-center text-red-500">
+                  La extracción de este proyecto falló. Puedes reintentarla desde el panel lateral.
+                </p>
+              ) : (
+                <>
+                  <p className="text-xs max-w-xs text-center">
+                    Este proyecto todavía no se ha extraído.
+                  </p>
+                  <button
+                    onClick={() => executeExtraction(proyectoActivo)}
+                    disabled={isApiKeyMissing || !!uploadProgress}
+                    className="mt-1 flex items-center gap-2 px-4 py-2 text-xs font-bold text-white bg-blue-600 hover:bg-blue-700 disabled:bg-slate-200 disabled:text-slate-400 rounded-full transition-colors"
+                  >
+                    <Play size={12} fill="currentColor" /> Extraer {nombreProyecto(proyectoActivo)}
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+
+          {datosDelProyecto.length > 0 && (
             <div className="w-full flex flex-col mb-20 md:mb-6">
-              
+
               {/* VISTA MÓVIL: TARJETAS */}
               <div className="md:hidden flex flex-col gap-4">
                 {displayedData.map((row) => {
                   const master = getMasterInfo(row.dni);
                   const isValid = !!master;
+                  const badge = methodBadge(row);
                   return (
                     <div key={row.id} className="bg-white rounded-2xl shadow-sm border border-slate-200 p-4 flex flex-col gap-3 relative overflow-hidden">
                       <div className={`absolute top-0 left-0 w-1.5 h-full ${isValid ? 'bg-emerald-500' : 'bg-red-500'}`}></div>
@@ -1397,7 +1873,7 @@ export default function App() {
                               <div className="absolute left-0 top-full mt-1 z-50 bg-white border border-amber-200 rounded-xl shadow-lg p-2 min-w-[240px]">
                                 {row.matchCandidates.map((c, ci) => (
                                   <button key={ci} onClick={() => {
-                                    const updated = extractedData.map(r => r.id === row.id ? { ...r, dni: c.master.dni, method: "IA" as MatchMethod, matchConfidence: c.score } : r);
+                                    const updated = extractedData.map(r => r.id === row.id ? { ...r, dni: c.master.dni, method: "AUTO" as MatchMethod, matchConfidence: c.score } : r);
                                     setExtractedData(updated);
                                     setActiveCandidateRow(null);
                                   }} className="w-full text-left px-3 py-2 hover:bg-amber-50 rounded-lg transition-colors">
@@ -1422,18 +1898,8 @@ export default function App() {
                             )}
                             <span className="text-[9px] text-slate-400 italic truncate max-w-[120px]">{row.sourceFile}</span>
                           </div>
-                          <span className={`px-2 py-0.5 rounded text-[9px] font-bold border ${
-                            row.method === "IA"
-                              ? row.matchConfidence != null && confidenceLevel(row.matchConfidence) === "high"
-                                ? "bg-emerald-100 text-emerald-700 border-emerald-200"
-                                : row.matchConfidence != null && confidenceLevel(row.matchConfidence) === "medium"
-                                  ? "bg-amber-100 text-amber-700 border-amber-200"
-                                  : "bg-purple-100 text-purple-700 border-purple-200"
-                              : row.method === "MANUAL" ? "bg-amber-100 text-amber-700 border-amber-200" : "bg-slate-100 text-slate-600 border-slate-200"
-                          }`}>
-                            {row.method === "IA" && row.matchConfidence != null
-                              ? `IA ${Math.round(row.matchConfidence * 100)}%`
-                              : row.method}
+                          <span className={`px-2 py-0.5 rounded text-[9px] font-bold border ${badge.className}`}>
+                            {badge.label}
                           </span>
                         </div>
                       </div>
@@ -1464,6 +1930,7 @@ export default function App() {
                       {displayedData.map((row) => {
                         const master = getMasterInfo(row.dni);
                         const isValid = !!master;
+                        const badge = methodBadge(row);
                         return (
                           <tr key={row.id} className="hover:bg-slate-50/50 transition-colors group/row">
                             <td className="px-4 py-3 text-slate-400">{row.nro}</td>
@@ -1489,18 +1956,8 @@ export default function App() {
                             </td>
                             <td className="px-4 py-3 text-center">
                               <div className="flex flex-col items-center gap-1">
-                                <span className={`inline-flex items-center px-2 py-0.5 rounded text-[9px] font-bold border ${
-                                  row.method === "IA"
-                                    ? row.matchConfidence != null && confidenceLevel(row.matchConfidence) === "high"
-                                      ? "bg-emerald-100 text-emerald-700 border-emerald-200"
-                                      : row.matchConfidence != null && confidenceLevel(row.matchConfidence) === "medium"
-                                        ? "bg-amber-100 text-amber-700 border-amber-200"
-                                        : "bg-purple-100 text-purple-700 border-purple-200"
-                                    : row.method === "MANUAL" ? "bg-amber-100 text-amber-700 border-amber-200" : "bg-slate-100 text-slate-600 border-slate-200"
-                                }`}>
-                                  {row.method === "IA" && row.matchConfidence != null
-                                    ? `IA ${Math.round(row.matchConfidence * 100)}%`
-                                    : row.method}
+                                <span className={`inline-flex items-center px-2 py-0.5 rounded text-[9px] font-bold border ${badge.className}`}>
+                                  {badge.label}
                                 </span>
                                 {!isValid && row.matchCandidates && row.matchCandidates.length > 0 && (
                                   <div className="relative">
@@ -1514,7 +1971,7 @@ export default function App() {
                                       <div className="absolute right-0 top-full mt-1 z-50 bg-white border border-amber-200 rounded-xl shadow-lg p-2 min-w-[260px]">
                                         {row.matchCandidates.map((c, ci) => (
                                           <button key={ci} onClick={() => {
-                                            const updated = extractedData.map(r => r.id === row.id ? { ...r, dni: c.master.dni, method: "IA" as MatchMethod, matchConfidence: c.score } : r);
+                                            const updated = extractedData.map(r => r.id === row.id ? { ...r, dni: c.master.dni, method: "AUTO" as MatchMethod, matchConfidence: c.score } : r);
                                             setExtractedData(updated);
                                             setActiveCandidateRow(null);
                                           }} className="w-full text-left px-3 py-2 hover:bg-amber-50 rounded-lg transition-colors">
@@ -1568,8 +2025,12 @@ export default function App() {
                   </div>
                 </div>
                 <div>
-                  <h3 className="text-lg font-bold text-slate-800 mb-2">Extrayendo Datos con IA</h3>
-                  <p className="text-sm text-slate-500 leading-relaxed">Estamos analizando tus documentos. Esto puede tomar unos segundos dependiendo de la complejidad...</p>
+                  <h3 className="text-lg font-bold text-slate-800 mb-2">Extrayendo Datos</h3>
+                  <p className="text-sm text-slate-500 leading-relaxed">
+                    {/* Se nombra el documento: ahora se procesa de uno en uno y conviene
+                        que se vea cuál, sobre todo si hay varios en la lista. */}
+                    Analizando <strong className="text-slate-700">{proyectoObjetivo ? nombreProyecto(proyectoObjetivo) : "el documento"}</strong>. Esto puede tomar unos segundos dependiendo de la complejidad…
+                  </p>
                 </div>
                 <div className="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden">
                   <motion.div 
@@ -1649,9 +2110,9 @@ export default function App() {
                   </div>
                 )}
                 <div className="flex items-center bg-white/10 backdrop-blur-xl rounded-xl md:rounded-2xl border border-white/20 p-1 mr-1 md:mr-2 shadow-2xl">
-                  <button onClick={() => setZoomLevel(p => Math.max(0.5, p/1.2))} className="p-1.5 md:p-2.5 text-white/80 hover:text-white hover:bg-white/10 rounded-lg md:rounded-xl transition-all"><ZoomOut size={16} className="md:w-5 md:h-5"/></button>
+                  <button onClick={() => fijarVista({ zoom: zoomTargetRef.current / 1.2 }, true)} className="p-1.5 md:p-2.5 text-white/80 hover:text-white hover:bg-white/10 rounded-lg md:rounded-xl transition-all"><ZoomOut size={16} className="md:w-5 md:h-5"/></button>
                   <div className="px-2 md:px-4 min-w-[50px] md:min-w-[70px] text-center"><span className="text-xs md:text-sm font-mono font-black text-blue-400">{(zoomLevel*100).toFixed(0)}%</span></div>
-                  <button onClick={() => setZoomLevel(p => Math.min(15, p*1.2))} className="p-1.5 md:p-2.5 text-white/80 hover:text-white hover:bg-white/10 rounded-lg md:rounded-xl transition-all"><ZoomIn size={16} className="md:w-5 md:h-5"/></button>
+                  <button onClick={() => fijarVista({ zoom: zoomTargetRef.current * 1.2 }, true)} className="p-1.5 md:p-2.5 text-white/80 hover:text-white hover:bg-white/10 rounded-lg md:rounded-xl transition-all"><ZoomIn size={16} className="md:w-5 md:h-5"/></button>
                 </div>
                 <button onClick={resetViewer} className="p-2 md:p-3 bg-white/10 backdrop-blur-xl text-white/80 hover:text-white hover:bg-white/10 rounded-xl md:rounded-2xl border border-white/20 shadow-2xl transition-all" title="Reiniciar vista"><RotateCcw size={16} className="md:w-5 md:h-5"/></button>
                 <button onClick={() => setViewingImage(null)} className="hidden md:block ml-2 p-3 bg-red-500/20 text-red-400 hover:bg-red-500 hover:text-white rounded-2xl border border-red-500/30 shadow-2xl transition-all"><X size={24}/></button>
@@ -1669,11 +2130,26 @@ export default function App() {
               onTouchMove={handleTouchMove}
               onTouchEnd={handleTouchEnd}
             >
-              <motion.div
-                animate={{ scale: zoomLevel, x: panOffset.x, y: panOffset.y }}
-                transition={{ type: "spring", stiffness: 300, damping: 30, mass: 0.5 }}
+              {/* Transform directo en lugar de animate+spring de motion.
+                  El muelle re-arrancaba una animación de ~400 ms en CADA paso de rueda,
+                  así que el zoom siempre iba por detrás del gesto y el arrastre "flotaba"
+                  en vez de seguir al cursor. Un gesto continuo no debe animarse: la
+                  posición del dedo o de la rueda ya es la animación.
+
+                  `will-change` SOLO durante el gesto. Dejarlo fijo mantenía la capa
+                  rasterizada a la escala inicial y el navegador se limitaba a estirar
+                  esos píxeles: por eso al ampliar se veía borroso. Al soltarlo, Chrome
+                  vuelve a rasterizar desde el original a la escala actual y la imagen
+                  recupera el detalle. */}
+              <div
                 className="relative pointer-events-none"
-                style={{ width: "fit-content", height: "fit-content", lineHeight: 0 }}
+                style={{
+                  width: "fit-content",
+                  height: "fit-content",
+                  lineHeight: 0,
+                  transform: `translate3d(${panOffset.x}px, ${panOffset.y}px, 0) scale(${zoomLevel})`,
+                  willChange: gestoActivo ? "transform" : "auto",
+                }}
               >
                 <img
                   src={viewingImage.url}
@@ -1709,7 +2185,7 @@ export default function App() {
                   </motion.div>
                   );
                 })()}
-              </motion.div>
+              </div>
             </div>
 
             {/* Panel de edición del registro actual */}
@@ -1723,7 +2199,12 @@ export default function App() {
                   inset-x-0 bottom-0 max-h-[46vh] rounded-t-3xl border-t border-white/10
                   md:inset-y-0 md:left-auto md:right-0 md:bottom-auto md:w-[384px] md:max-h-none md:rounded-none md:border-t-0 md:border-l md:pt-20"
               >
-                <div className="overflow-y-auto p-5 flex flex-col gap-4 scrollbar-hide">
+                {/* `flex-1 min-h-0` es lo que hace que este bloque scrollee de verdad.
+                    Un ítem flex tiene min-height:auto por defecto, así que crecía hasta
+                    la altura de su contenido y desbordaba el panel en vez de recortarse:
+                    overflow-y-auto no tenía nada que recortar y la lista de búsqueda
+                    quedaba cortada por abajo, sin forma de llegar a ella. */}
+                <div className="flex-1 min-h-0 overflow-y-auto p-5 flex flex-col gap-4 scrollbar-hide">
                   <div className="md:hidden mx-auto w-10 h-1 rounded-full bg-white/20 -mt-1 mb-1" />
 
                   <div className="flex items-center justify-between gap-2">
@@ -1738,7 +2219,7 @@ export default function App() {
 
                   {/* Desplegable: navegar solo entre registros FUERA (sin match) */}
                   {(() => {
-                    const fueraRows = extractedData.filter((r) => !getMasterInfo(r.dni));
+                    const fueraRows = datosDelProyecto.filter((r) => !getMasterInfo(r.dni));
                     return (
                       <div>
                         <div className="flex items-stretch gap-1.5">
@@ -1836,7 +2317,7 @@ export default function App() {
                     <div className="flex flex-col gap-1.5">
                       <p className="text-[10px] text-amber-300 font-bold uppercase tracking-wider">💡 Sugerencias</p>
                       {viewingRow.matchCandidates.map((c, ci) => (
-                        <button key={ci} onClick={() => applyDniToRow(viewingRow.id, c.master.dni, "IA", c.score)} className="text-left bg-amber-500/10 hover:bg-amber-500/20 border border-amber-400/20 rounded-xl px-3 py-2 transition-colors">
+                        <button key={ci} onClick={() => applyDniToRow(viewingRow.id, c.master.dni, "AUTO", c.score)} className="text-left bg-amber-500/10 hover:bg-amber-500/20 border border-amber-400/20 rounded-xl px-3 py-2 transition-colors">
                           <div className="flex items-center justify-between gap-2">
                             <span className="text-xs font-semibold text-white truncate">{c.master.nombre}</span>
                             <span className="text-[10px] font-bold text-amber-300 shrink-0">{Math.round(c.score * 100)}%</span>
@@ -2050,8 +2531,16 @@ export default function App() {
                 <Database size={18} className="text-green-600" />
                 <h3 className="font-bold text-slate-800">Enviar a Google Sheets</h3>
               </div>
+              {/* El envío es irreversible desde aquí: si se manda el proyecto que no era,
+                  hay que ir a limpiarlo a mano en la hoja. Por eso el origen se nombra
+                  antes de confirmar, y no solo con el resaltado del lateral. */}
               <p className="text-xs text-slate-500 mb-4">
-                Se enviarán {displayedData.filter((r: ExtractedRow) => !!getMasterInfo(r.dni)).length} participante(s) con coincidencia en la maestra.
+                Se enviarán <strong className="text-slate-700">{displayedData.filter((r: ExtractedRow) => !!getMasterInfo(r.dni)).length} participante(s)</strong> con coincidencia en la maestra
+                {proyectoActivo
+                  ? <> del documento <strong className="text-slate-700">{proyectoActivo.name}</strong>{projectTitles[proyectoActivo.id]?.trim() ? ` («${projectTitles[proyectoActivo.id].trim()}»)` : ""}.</>
+                  : files.length > 1
+                    ? <> de <strong className="text-slate-700">los {files.length} documentos cargados</strong>. Selecciona uno en el lateral si solo quieres enviar ese.</>
+                    : <>.</>}
               </p>
               <label className="block text-xs font-semibold text-slate-600 mb-1.5">IdRef</label>
               <input
@@ -2074,6 +2563,47 @@ export default function App() {
                   {sending ? <Loader2 size={14} className="animate-spin" /> : <Database size={14} />} Enviar
                 </button>
               </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Confirmación del envío. A diferencia del resto de avisos, este no se cierra solo
+          ni al pulsar fuera: hay que aceptarlo. Es el acuse de recibo de una acción que
+          ya no se puede deshacer desde aquí, así que tiene que quedar leído. */}
+      <AnimatePresence>
+        {envioOk && (
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[120] flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-4"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="envio-ok-titulo"
+          >
+            <motion.div
+              initial={{ scale: 0.94, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.94, opacity: 0 }}
+              className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6 text-center"
+            >
+              <div className="mx-auto mb-4 w-14 h-14 rounded-full bg-emerald-50 border border-emerald-200 flex items-center justify-center">
+                <CheckCircle2 size={30} className="text-emerald-600" />
+              </div>
+              <h3 id="envio-ok-titulo" className="text-lg font-bold text-slate-800 mb-1">Envío exitoso</h3>
+              <p className="text-sm text-slate-500 leading-relaxed">
+                Se enviaron <strong className="text-slate-700">{envioOk.cantidad} participante(s)</strong> a Google Sheets.
+              </p>
+              <div className="mt-4 rounded-xl bg-slate-50 border border-slate-200 px-3 py-2.5 text-left">
+                <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Proyecto</p>
+                <p className="text-xs font-semibold text-slate-700 truncate">{envioOk.proyecto}</p>
+                <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mt-2">IdRef</p>
+                <p className="text-xs font-mono font-semibold text-slate-700 truncate">{envioOk.idRef}</p>
+              </div>
+              <button
+                autoFocus
+                onClick={() => setEnvioOk(null)}
+                className="w-full mt-5 px-3 py-2.5 text-sm font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-xl transition-colors"
+              >
+                Aceptar
+              </button>
             </motion.div>
           </motion.div>
         )}
