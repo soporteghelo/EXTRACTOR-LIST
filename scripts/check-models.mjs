@@ -6,17 +6,17 @@
  * una petición fallida antes de dar con uno vivo. Este script detecta esa situación
  * sin tener que abrir la app.
  *
- *   VITE_GEMINI_API_KEY=xxx node scripts/check-models.mjs
+ *   GEMINI_API_KEY=xxx node scripts/check-models.mjs
  *   (o con un .env en la raíz)
  */
 import { readFileSync } from "node:fs";
 import { GoogleGenAI } from "@google/genai";
 
 function leerClave() {
-  if (process.env.VITE_GEMINI_API_KEY) return process.env.VITE_GEMINI_API_KEY;
+  if (process.env.GEMINI_API_KEY) return process.env.GEMINI_API_KEY;
   try {
     const env = readFileSync(new URL("../.env", import.meta.url), "utf8");
-    return /^VITE_GEMINI_API_KEY\s*=\s*(.+)$/m.exec(env)?.[1]?.trim().replace(/^["']|["']$/g, "");
+    return /^GEMINI_API_KEY\s*=\s*(.+)$/m.exec(env)?.[1]?.trim().replace(/^["']|["']$/g, "");
   } catch {
     return undefined;
   }
@@ -29,7 +29,7 @@ const modelos = [...bloque.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
 
 const apiKey = leerClave();
 if (!apiKey) {
-  console.error("Falta VITE_GEMINI_API_KEY (variable de entorno o .env en la raíz).");
+  console.error("Falta GEMINI_API_KEY (variable de entorno o .env en la raíz).");
   process.exit(1);
 }
 

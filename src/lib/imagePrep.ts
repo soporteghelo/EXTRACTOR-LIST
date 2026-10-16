@@ -47,10 +47,15 @@ function partirDataUrl(dataUrl: string): ImagenPreparada {
  *
  * Si algo falla, devuelve la imagen original: preprocesar nunca debe impedir extraer.
  */
-// `maxSide` va alineado con la resolución a la que se rasterizan las páginas de PDF:
-// si aquí se recortase por debajo, se perdería justo el detalle que allí se busca.
-// Los dígitos manuscritos en casillas necesitan píxeles; quedarse corto los vuelve ilegibles.
-export async function enhanceForOcr(dataUrl: string, maxSide = 2600): Promise<ImagenPreparada> {
+// `maxSide` = 2200: algo por debajo de los 2600 px a los que se rasterizan los PDF. Desde
+// que la extracción pasa por /api/gemini, cada envío tiene un techo de 4.5 MB (Vercel), y
+// a 2600 px un PDF de 3 hojas ya no cabía. 2200 px recorta ~30% del área y sigue dejando a
+// un A4 vertical con 20 filas unos 70 px por renglón, de sobra para dígitos manuscritos.
+// No bajar mucho más: quedarse corto de píxeles vuelve ilegibles los dígitos en casillas.
+// Solo afecta a lo que se ENVÍA: el visor y los recortes de relectura usan la página a
+// resolución completa, y las coordenadas del modelo son relativas (0-1000), así que la
+// marca sigue cayendo en su fila aunque la imagen enviada sea más pequeña.
+export async function enhanceForOcr(dataUrl: string, maxSide = 2200): Promise<ImagenPreparada> {
   try {
     const img = await cargarImagen(dataUrl);
     const W0 = img.naturalWidth, H0 = img.naturalHeight;
@@ -123,9 +128,10 @@ export async function enhanceForOcr(dataUrl: string, maxSide = 2600): Promise<Im
     }
     ctx.putImageData(src, 0, 0);
 
-    // 0.86: en una imagen ya en escala de grises y de alto contraste, bajar de 0.92
-    // recorta bastante el peso del envío sin que el trazo pierda definición.
-    return partirDataUrl(canvas.toDataURL("image/jpeg", 0.86));
+    // 0.82: en una imagen ya en escala de grises y de alto contraste, la compresión
+    // apenas afecta al trazo (los artefactos JPEG aparecen sobre todo en degradados de
+    // color, que aquí no hay) y recorta bastante el peso del envío.
+    return partirDataUrl(canvas.toDataURL("image/jpeg", 0.82));
   } catch (err) {
     console.warn("No se pudo preprocesar la imagen, se envía tal cual:", err);
     return partirDataUrl(dataUrl);

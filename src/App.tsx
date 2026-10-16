@@ -35,7 +35,7 @@ import {
   Maximize2, RotateCcw, MousePointer2, Grab, Menu, PanelLeftClose, PanelLeftOpen, Link2, Layers, FilterX
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
-import { processDocuments, releerFilas } from "./lib/gemini";
+import { claveConfigurada, processDocuments, releerFilas } from "./lib/gemini";
 import { recortarFilas, type RecorteFila } from "./lib/rowCrop";
 import { copiarTexto } from "./lib/clipboard";
 import { renderPdfToImages } from "./lib/pdf";
@@ -338,12 +338,13 @@ export default function App() {
   const [isApiKeyMissing, setIsApiKeyMissing] = useState<boolean>(false);
   
   useEffect(() => {
-    // Check for API key on mount
-    const key = (import.meta as any).env?.VITE_GEMINI_API_KEY;
-    if (!key) {
-      setIsApiKeyMissing(true);
-      setErrorMessage("ADVERTENCIA: Falta la variable de entorno VITE_GEMINI_API_KEY. Configúrala en Vercel para que la extracción funcione.");
-    }
+    // La clave vive en el servidor: solo se pregunta si está configurada.
+    claveConfigurada().then((ok) => {
+      if (!ok) {
+        setIsApiKeyMissing(true);
+        setErrorMessage("ADVERTENCIA: Falta la variable de entorno GEMINI_API_KEY. Configúrala en Vercel para que la extracción funcione.");
+      }
+    });
   }, []);
   
   const [showSearch, setShowSearch] = useState(false);
@@ -616,8 +617,10 @@ export default function App() {
         if (f.ocrPages.length === 1) {
           return [{ data: f.ocrPages[0].base64, mimeType: f.ocrPages[0].mimeType, name: f.name }];
         }
+        // `pagina` deja que processDocuments reparta un PDF largo en varios envíos sin
+        // perder a qué hoja pertenece cada fila.
         return f.ocrPages.map((p, i) => ({
-          data: p.base64, mimeType: p.mimeType, name: `${f.name} (página ${i + 1})`,
+          data: p.base64, mimeType: p.mimeType, name: `${f.name} (página ${i + 1})`, pagina: i + 1,
         }));
       })();
       const result = await processDocuments(inputFormats);
@@ -1508,7 +1511,7 @@ export default function App() {
           {isApiKeyMissing && (
             <div className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-2 text-amber-700">
               <AlertCircle size={16} className="flex-shrink-0 mt-0.5" />
-              <p className="text-[10px] font-medium leading-tight">Configura VITE_GEMINI_API_KEY en Vercel</p>
+              <p className="text-[10px] font-medium leading-tight">Configura GEMINI_API_KEY en Vercel</p>
             </div>
           )}
 

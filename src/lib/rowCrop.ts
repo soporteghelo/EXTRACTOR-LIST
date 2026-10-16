@@ -88,7 +88,9 @@ export async function recortarFilas(
 
       // Misma limpieza que el resto del pipeline. En un recorte pequeño la corrección de
       // iluminación es incluso más certera: hay menos variación de luz que estimar.
-      const limpio = await enhanceForOcr(canvas.toDataURL("image/png"));
+      // 2600 explícito: un renglón puede medir todo el ancho de la página, y la relectura
+      // existe justo para darle el máximo detalle; el recorte pesa poco, cabe de sobra.
+      const limpio = await enhanceForOcr(canvas.toDataURL("image/png"), 2600);
       recortes.push({ id: fila.id, base64: limpio.base64, mimeType: limpio.mimeType });
     } catch (err) {
       console.warn(`No se pudo recortar la fila ${fila.id}:`, err);

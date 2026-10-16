@@ -1,4 +1,4 @@
-import { GoogleGenAI, PartMediaResolutionLevel, Type, type Part } from "@google/genai";
+import { PartMediaResolutionLevel, Type, type Part } from "@google/genai";
 import { EXTRACTION_PROMPT as PROMPT, GEMINI_MODELS as MODELS } from "@/config";
 import type { RecorteFila } from "./rowCrop";
 
@@ -17,6 +17,64 @@ const CABECERA_CSV =
 // razonamiento interno del modelo sin comerse la respuesta.
 const MAX_OUTPUT_TOKENS = 32768;
 
+// Vercel rechaza (413) cualquier petición a una función que pase de 4.5 MB. Se comprueba
+// antes de enviar, con algo de margen, para dar un mensaje útil en vez de un fallo opaco;
+// y se aplica también en local para que lo que funciona aquí funcione desplegado.
+const LIMITE_PETICION_BYTES = 4.3 * 1024 * 1024;
+
+// Que un envío no quepa no depende del modelo: se marca para no reintentarlo con los
+// cinco modelos de la lista y cortar en seco con el mensaje útil.
+class ErrorTamano extends Error {}
+
+interface RespuestaGemini {
+  text: string;
+  finishReason: string | null;
+}
+
+/**
+ * Llama a Gemini a través de /api/gemini (api/gemini.ts). La API key vive solo en el
+ * servidor: el navegador nunca la ve, así que no se puede copiar de la web desplegada.
+ */
+async function llamarGemini(peticion: {
+  model: string;
+  contents: Part[];
+  config: Record<string, unknown>;
+}): Promise<RespuestaGemini> {
+  const cuerpo = JSON.stringify(peticion);
+  if (cuerpo.length > LIMITE_PETICION_BYTES) {
+    const mb = (cuerpo.length / 1024 / 1024).toFixed(1);
+    throw new ErrorTamano(
+      `Una sola página pesa ${mb} MB y el servidor admite hasta 4.5 MB por envío. Prueba con una imagen de menor resolución.`
+    );
+  }
+
+  const res = await fetch("/api/gemini", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: cuerpo,
+  });
+  // Vercel responde algunos fallos (413, timeout) con texto plano, no con JSON.
+  const datos = await res.json().catch(() => null);
+  if (!res.ok) {
+    if (res.status === 413) {
+      throw new ErrorTamano("El envío es demasiado grande para el servidor (límite de 4.5 MB).");
+    }
+    throw new Error(datos?.error || `El servidor respondió ${res.status}.`);
+  }
+  return { text: datos?.text ?? "", finishReason: datos?.finishReason ?? null };
+}
+
+/** La interfaz lo usa para avisar si falta la clave, sin llegar a conocerla. */
+export async function claveConfigurada(): Promise<boolean> {
+  try {
+    const res = await fetch("/api/gemini");
+    const datos = await res.json();
+    return !!datos?.configurada;
+  } catch {
+    return false;
+  }
+}
+
 // La resolución por parte solo existe en Gemini 3; en modelos anteriores el campo
 // provoca un error de petición, así que se omite y se acepta la resolución por defecto.
 function soportaResolucionPorParte(modelName: string): boolean {
@@ -33,7 +91,7 @@ function soportaResolucionPorParte(modelName: string): boolean {
  * dobla a 2240 y es justo el detalle fino donde hoy se pierden lecturas.
  */
 function construirPartes(
-  files: { data: string; mimeType: string; name: string }[],
+  files: ArchivoEntrada[],
   conResolucionAlta: boolean
 ): Part[] {
   const parts: Part[] = [];
@@ -58,16 +116,97 @@ function construirPartes(
   return parts;
 }
 
-export async function processDocuments(
-  files: { data: string; mimeType: string; name: string }[]
-): Promise<ProcessedResult> {
-  const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error("Falta la variable de entorno VITE_GEMINI_API_KEY.");
+export interface ArchivoEntrada {
+  data: string;
+  mimeType: string;
+  name: string;
+  /** Página real dentro del documento (1-based). Solo para PDFs de varias hojas. */
+  pagina?: number;
+}
+
+// Presupuesto por envío para el reparto en lotes. Por debajo del límite duro (4.3 MB) para
+// dejar sitio a las etiquetas, el prompt del sistema y el envoltorio JSON.
+const PRESUPUESTO_LOTE_BYTES = 3.8 * 1024 * 1024;
+
+/**
+ * Parte las páginas en lotes contiguos que quepan en un envío. Se busca el MENOR número
+ * de lotes, y de tamaño parejo (no "llenar el primero y el resto al último"): así cada
+ * llamada tarda parecido y, al ir en paralelo, el total lo marca el lote más lento.
+ *
+ * Parejo y contiguo también garantiza que los lotes 2.º en adelante empiezan en una
+ * página mayor que el tamaño de cualquier lote; renumerarPaginas se apoya en eso.
+ */
+function repartirEnLotes(files: ArchivoEntrada[]): ArchivoEntrada[][] {
+  const peso = (f: ArchivoEntrada) => f.data.length;
+  const total = files.reduce((acc, f) => acc + peso(f), 0);
+  for (let k = Math.max(1, Math.ceil(total / PRESUPUESTO_LOTE_BYTES)); k <= files.length; k++) {
+    const porLote = Math.ceil(files.length / k);
+    const lotes: ArchivoEntrada[][] = [];
+    for (let i = 0; i < files.length; i += porLote) lotes.push(files.slice(i, i + porLote));
+    if (lotes.every((l) => l.reduce((acc, f) => acc + peso(f), 0) <= PRESUPUESTO_LOTE_BYTES)) {
+      return lotes;
+    }
+  }
+  return files.map((f) => [f]); // una página por envío; si aun así no cabe, llamarGemini avisa
+}
+
+/**
+ * Deja la columna Pagina con el número de hoja REAL del documento. Dentro de un lote el
+ * modelo puede numerar desde 1 (la 6.ª hoja del PDF es la 2.ª imagen que ve), y el visor
+ * abriría entonces la hoja equivocada.
+ *
+ *  1. Si SourceFile coincide con la etiqueta de una imagen del lote, manda esa etiqueta.
+ *  2. Si no, un número que ya es una página del lote se respeta (vino en absoluto).
+ *  3. Si no, se lee como posición dentro del lote (vino en relativo).
+ */
+function renumerarPaginas(lineas: string[], lote: ArchivoEntrada[]): string[] {
+  const paginas = lote.map((f) => f.pagina);
+  if (paginas.some((p) => p === undefined)) return lineas; // imagen suelta: nada que hacer
+  const porEtiqueta = new Map(lote.map((f) => [f.name.trim().toLowerCase(), f.pagina!]));
+  const delLote = new Set(paginas as number[]);
+
+  return lineas.map((linea) => {
+    const cols = linea.split(";");
+    if (cols.length < 8) return linea;
+    const n = parseInt(cols[7], 10);
+    const real =
+      porEtiqueta.get(cols[5].trim().toLowerCase()) ??
+      (delLote.has(n) ? n : n >= 1 && n <= lote.length ? lote[n - 1].pagina : undefined);
+    if (real !== undefined) cols[7] = String(real);
+    return cols.join(";");
+  });
+}
+
+/**
+ * Extrae un documento. Un PDF de muchas hojas no cabe en un solo envío (límite de 4.5 MB
+ * de Vercel: 7 hojas ya lo pasan), así que se reparte en lotes que se procesan en
+ * paralelo y se unen en un único CSV. Cada hoja de estas fichas es independiente, así que
+ * partir entre hojas no le quita al modelo contexto que necesite.
+ */
+export async function processDocuments(files: ArchivoEntrada[]): Promise<ProcessedResult> {
+  const lotes = repartirEnLotes(files);
+  if (lotes.length > 1) {
+    console.log(`Documento repartido en ${lotes.length} envíos: ${lotes.map((l) => l.length).join(" + ")} páginas.`);
   }
 
-  const ai = new GoogleGenAI({ apiKey });
+  const resultados = await Promise.all(lotes.map((lote) => extraerLote(lote)));
 
+  const filas = resultados.flatMap((r, i) =>
+    renumerarPaginas(
+      r.csv.split("\n").filter((l) => l.trim() && !l.toLowerCase().includes("sourcefile")),
+      lotes[i]
+    )
+  );
+  const csv = [CABECERA_CSV, ...filas].join("\n");
+  if (lotes.length > 1) console.log("=== CSV unido de todos los envíos ===\n" + csv);
+
+  return {
+    csv,
+    modelUsed: [...new Set(resultados.map((r) => r.modelUsed))].join(" + "),
+  };
+}
+
+async function extraerLote(files: ArchivoEntrada[]): Promise<ProcessedResult> {
   let lastError: any;
   const triedModels: string[] = [];
 
@@ -76,7 +215,7 @@ export async function processDocuments(
       console.log(`Intentando extracción con el modelo: ${modelName}`);
       triedModels.push(modelName);
 
-      const response = await ai.models.generateContent({
+      const response = await llamarGemini({
         model: modelName,
         contents: construirPartes(files, soportaResolucionPorParte(modelName)),
         config: {
@@ -88,10 +227,9 @@ export async function processDocuments(
         },
       });
 
-      const finishReason = response.candidates?.[0]?.finishReason;
-      if (finishReason === "MAX_TOKENS") {
+      if (response.finishReason === "MAX_TOKENS") {
         throw new Error(
-          "La respuesta se cortó por longitud: el documento tiene más filas de las que caben en una sola pasada. Divide el lote en menos archivos."
+          "La respuesta se cortó por longitud: el documento tiene más filas de las que caben en una sola pasada."
         );
       }
 
@@ -116,6 +254,7 @@ export async function processDocuments(
         modelUsed: modelName,
       };
     } catch (error: any) {
+      if (error instanceof ErrorTamano) throw error;
       console.error(`Error con el modelo ${modelName}:`, error);
       lastError = error;
     }
@@ -183,13 +322,9 @@ export async function releerFilas(
 ): Promise<{ lecturas: LecturaFila[]; modelUsed: string }> {
   if (recortes.length === 0) return { lecturas: [], modelUsed: "" };
 
-  const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
-  if (!apiKey) throw new Error("Falta la variable de entorno VITE_GEMINI_API_KEY.");
   if (MODELOS_RELECTURA.length === 0) {
     throw new Error("La relectura necesita un modelo Gemini 3 en GEMINI_MODELS.");
   }
-
-  const ai = new GoogleGenAI({ apiKey });
 
   const parts: Part[] = [];
   recortes.forEach((r) => {
@@ -217,7 +352,7 @@ export async function releerFilas(
   let lastError: any;
   for (const modelName of MODELOS_RELECTURA) {
     try {
-      const response = await ai.models.generateContent({
+      const response = await llamarGemini({
         model: modelName,
         contents: parts,
         config: {
@@ -229,7 +364,7 @@ export async function releerFilas(
         },
       });
 
-      if (response.candidates?.[0]?.finishReason === "MAX_TOKENS") {
+      if (response.finishReason === "MAX_TOKENS") {
         throw new Error("La relectura se cortó por longitud.");
       }
       const text = response.text;
@@ -239,6 +374,7 @@ export async function releerFilas(
       console.log(`=== Relectura (${modelName}) ===`, lecturas);
       return { lecturas, modelUsed: modelName };
     } catch (error: any) {
+      if (error instanceof ErrorTamano) throw error;
       console.error(`Relectura fallida con ${modelName}:`, error);
       lastError = error;
     }
