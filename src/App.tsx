@@ -933,14 +933,51 @@ export default function App() {
     }
   };
 
-  const getCsvString = () => {
-    const header = "DNI;NOMBRE OFICIAL;OCUPACION;AREA;METODO;ORIGEN;FILA DOC";
-    const bodyRows = displayedData.map((row: ExtractedRow) => {
+  // Filas exportables (solo las que tienen coincidencia en la maestra). Copiar y Descargar
+  // salen de aquí para que el portapapeles y el Excel nunca digan cosas distintas.
+  const CABECERA_EXPORT = ["DNI", "NOMBRE OFICIAL", "OCUPACION", "AREA", "METODO", "ORIGEN", "FILA DOC"];
+  const getFilasExport = (): string[][] =>
+    displayedData.flatMap((row: ExtractedRow) => {
       const master = getMasterInfo(row.dni);
-      if (!master) return null;
-      return `${row.dni.toUpperCase()};${master.nombre.toUpperCase()};${master.cargo.toUpperCase()};${master.area.toUpperCase()};${row.method};${row.sourceFile};${row.filaDoc}`;
-    }).filter((r: string | null) => r !== null);
-    return [header, ...bodyRows].join('\n');
+      if (!master) return [];
+      return [[
+        row.dni.toUpperCase(), master.nombre.toUpperCase(), master.cargo.toUpperCase(),
+        master.area.toUpperCase(), row.method, row.sourceFile, row.filaDoc,
+      ]];
+    });
+
+  const getCsvString = () =>
+    [CABECERA_EXPORT, ...getFilasExport()].map((cols) => cols.join(";")).join('\n');
+
+  const descargarExcel = async () => {
+    const filas = getFilasExport();
+    if (filas.length === 0) {
+      mostrarToast("error", "No hay filas con coincidencia en la maestra para descargar.");
+      return;
+    }
+    try {
+      // Carga diferida: la librería solo hace falta al pulsar el botón.
+      const { default: writeExcelFile } = await import("write-excel-file/browser");
+      const sheetData = [
+        CABECERA_EXPORT.map((titulo) => ({ value: titulo, fontWeight: "bold" as const })),
+        // Todo como texto, también el DNI: como número, Excel le quitaría el cero inicial
+        // ("04223082" -> 4223082) y ya no cruzaría con la maestra.
+        ...filas.map((cols) => cols.map((valor) => ({ value: valor, type: String }))),
+      ];
+      // El nombre lleva el proyecto: descargar dos documentos seguidos dejaba
+      // dos "participantes" indistinguibles en la carpeta de descargas.
+      const nombre = proyectoActivo
+        ? `participantes-${fileStem(proyectoActivo.name).replace(/[^a-z0-9]+/gi, "-")}.xlsx`
+        : "participantes.xlsx";
+      await writeExcelFile(sheetData, {
+        sheet: "Participantes",
+        columns: [{ width: 12 }, { width: 40 }, { width: 28 }, { width: 22 }, { width: 14 }, { width: 22 }, { width: 10 }],
+        stickyRowsCount: 1,
+      }).toFile(nombre);
+    } catch (err: any) {
+      console.error("No se pudo generar el Excel:", err);
+      mostrarToast("error", `No se pudo generar el Excel: ${err?.message || err}`);
+    }
   };
 
   // Quita solo la última extensión: "CamScanner 02-08 16.45.jpeg" → "camscanner 02-08 16.45".
@@ -1738,22 +1775,7 @@ export default function App() {
                      : "No se pudo copiar. Usa el botón Descargar."
                 );
               }} className="flex-shrink-0 flex items-center gap-1.5 px-3 py-1.5 text-xs md:text-sm font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors"><Copy size={14} /> <span className="hidden md:inline">Copiar</span></button>
-              <button onClick={() => {
-                const blob = new Blob([getCsvString()], { type: "text/csv;charset=utf-8;" });
-                const url = URL.createObjectURL(blob);
-                const link = document.createElement("a");
-                // El nombre lleva el proyecto: descargar dos documentos seguidos dejaba
-                // dos "participantes.csv" indistinguibles en la carpeta de descargas.
-                const nombreCsv = proyectoActivo
-                  ? `participantes-${fileStem(proyectoActivo.name).replace(/[^a-z0-9]+/gi, "-")}.csv`
-                  : "participantes.csv";
-                link.href = url; link.setAttribute("download", nombreCsv);
-                // Algunos navegadores ignoran el click si el enlace no está en el DOM.
-                document.body.appendChild(link);
-                link.click();
-                document.body.removeChild(link);
-                URL.revokeObjectURL(url);
-              }} className="flex-shrink-0 flex items-center gap-1.5 px-3 py-1.5 text-xs md:text-sm font-medium text-white bg-slate-800 rounded-lg hover:bg-slate-900 transition-colors"><Download size={14} /> <span className="hidden md:inline">Descargar</span></button>
+              <button onClick={descargarExcel} title="Descargar en Excel (.xlsx)" className="flex-shrink-0 flex items-center gap-1.5 px-3 py-1.5 text-xs md:text-sm font-medium text-white bg-slate-800 rounded-lg hover:bg-slate-900 transition-colors"><Download size={14} /> <span className="hidden md:inline">Descargar</span></button>
               <button
                 disabled={sending || displayedData.length === 0}
                 onClick={() => { setIdRefInput(""); setSheetsModal(true); }}
