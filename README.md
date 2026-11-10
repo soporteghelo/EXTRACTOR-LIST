@@ -33,7 +33,7 @@ Para que el despliegue funcione correctamente, debes configurar la variable en e
 4. Si existe una variable antigua `VITE_GEMINI_API_KEY`, **bórrala**.
 5. **Importante:** Ve a la pestaña **Deployments** y realiza un **Redeploy** para que la función tome la variable nueva.
 
-> Cada envío a `/api/gemini` puede pesar como máximo 4.5 MB (límite de Vercel). Las imágenes se envían reducidas a 2200 px para que quepan varias páginas; si un PDF muy largo no cabe, la app pide dividirlo.
+> Cada envío a `/api/gemini` puede pesar como máximo 4.5 MB (límite de Vercel). La app manda **3 páginas por envío** (para no agotar la cuota gratuita de Gemini, 20 peticiones al día por modelo), así que un PDF de cualquier número de hojas cabe sin dividirlo. Con facturación activada conviene bajar `PAGINAS_POR_ENVIO` a 1 en [src/lib/gemini.ts](./src/lib/gemini.ts): es lo más rápido.
 
 > ⚠️ Si no configuras esta variable en Vercel, el botón de extracción se deshabilitará por seguridad y mostrará una alerta naranja en la interfaz.
 

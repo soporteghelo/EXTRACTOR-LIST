@@ -1,6 +1,7 @@
 import { PartMediaResolutionLevel, Type, type Part } from "@google/genai";
-import { EXTRACTION_PROMPT as PROMPT, GEMINI_MODELS as MODELS } from "@/config";
+import { EXTRACTION_INSTRUCTION, EXTRACTION_PROMPT as PROMPT, GEMINI_MODELS as MODELS } from "@/config";
 import type { RecorteFila } from "./rowCrop";
+import type { Renglones, Zona } from "./tableCrop";
 
 export interface ProcessedResult {
   csv: string;
@@ -26,6 +27,146 @@ const LIMITE_PETICION_BYTES = 4.3 * 1024 * 1024;
 // cinco modelos de la lista y cortar en seco con el mensaje útil.
 class ErrorTamano extends Error {}
 
+/** Error de la API con su código HTTP, para saber si el modelo está saturado. */
+class ErrorModelo extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Salud de los modelos
+// ---------------------------------------------------------------------------
+// Un modelo saturado tarda ~20 s en devolver 503, o se cuelga hasta agotar el límite.
+// Sin memoria, cada acta (y cada página) volvía a pagar ese tiempo con el mismo modelo
+// antes de pasar al siguiente. Se recuerda el fallo y, mientras tanto, ese modelo se
+// prueba al final en vez de al principio. No se descarta: si los demás también fallan,
+// se le sigue dando su oportunidad.
+const PENALIZACION_SATURADO_MS = 5 * 60_000;
+// Cuota (429). Google dice en el propio error cuánto falta para que se libere: segundos
+// si es el límite por minuto, horas si es el diario del plan gratuito (20 peticiones al
+// día por modelo). Se respeta ese plazo; si no viene, se asume el límite por minuto.
+const PENALIZACION_CUOTA_MS = 60_000;
+// A partir de aquí una penalización ya no es "espera un poco" sino "hoy no": el modelo
+// se salta del todo mientras quede algún otro disponible.
+const UMBRAL_AGOTADO_MS = 10 * 60_000;
+
+// Se guarda en el navegador para que sobreviva a recargar la página: sin esto, cada
+// recarga volvía a gastar ~7 s por modelo agotado y por envío antes de dar con uno vivo.
+const CLAVE_SALUD = "intelliextract.modelosPenalizados";
+
+function cargarSalud(): Map<string, number> {
+  try {
+    const guardado = JSON.parse(localStorage.getItem(CLAVE_SALUD) || "{}") as Record<string, number>;
+    return new Map(Object.entries(guardado).filter(([, hasta]) => hasta > Date.now()));
+  } catch {
+    return new Map(); // modo privado, almacenamiento bloqueado o dato corrupto
+  }
+}
+
+const saturadoHasta = cargarSalud();
+
+function penalizar(modelo: string, ms: number) {
+  saturadoHasta.set(modelo, Date.now() + ms);
+  try {
+    localStorage.setItem(CLAVE_SALUD, JSON.stringify(Object.fromEntries(saturadoHasta)));
+  } catch { /* sin almacenamiento: la memoria de esta pestaña sigue valiendo */ }
+}
+
+/** Plazo que da Google en un 429 ("retryDelay":"20269s"), con tope de un día. */
+function esperaDeCuota(mensaje: string): number {
+  const m = /"retryDelay"\s*:\s*"([\d.]+)s"/.exec(mensaje);
+  const ms = m ? parseFloat(m[1]) * 1000 : 0;
+  return Math.min(Math.max(ms, PENALIZACION_CUOTA_MS), 24 * 3600_000);
+}
+
+/** Intento cortado a propósito porque otra página ya vio el modelo saturado. */
+class ErrorCancelado extends Error {}
+
+// Peticiones en vuelo por modelo. Las páginas van en paralelo: cuando una recibe un 503 o
+// un 504, las demás que esperan a ese mismo modelo casi seguro acabarán igual (medido:
+// una página se quedó 90 s colgada en un modelo que otra petición ya había visto caído),
+// así que se cancelan y pasan al siguiente.
+//
+// Un 429 NO cancela a nadie: es la cuota por minuto de ESA petición, y las demás ya
+// fueron admitidas. Cancelarlas (primera versión de esto) desataba una cascada: un 429
+// tumbaba las 6 páginas, saltaban juntas al siguiente modelo, otro 429, y así hasta
+// agotar la cadena entera.
+const enCurso = new Map<string, Set<AbortController>>();
+
+function registrarFallo(modelo: string, error: unknown) {
+  if (error instanceof ErrorCancelado) return; // ya registrado por quien lo vio
+  const status = error instanceof ErrorModelo ? error.status : error instanceof TypeError ? 503 : 0;
+  if (status === 429) {
+    penalizar(modelo, esperaDeCuota((error as Error).message));
+  } else if (status >= 500) {
+    penalizar(modelo, PENALIZACION_SATURADO_MS);
+    for (const control of enCurso.get(modelo) ?? []) {
+      control.abort(new ErrorCancelado(`${modelo} está saturado: se pasa al siguiente modelo.`));
+    }
+  }
+}
+
+/**
+ * Ejecuta un intento registrándolo como "en vuelo" para poder cancelarlo desde fuera.
+ * El último modelo de la cadena no se registra: cancelarlo no lleva a ningún sitio mejor.
+ */
+async function conCancelacion<T>(
+  modelo: string,
+  cancelable: boolean,
+  fn: (signal?: AbortSignal) => Promise<T>
+): Promise<T> {
+  if (!cancelable) return fn();
+  const control = new AbortController();
+  const vivos = enCurso.get(modelo) ?? new Set<AbortController>();
+  enCurso.set(modelo, vivos.add(control));
+  try {
+    return await fn(control.signal);
+  } finally {
+    vivos.delete(control);
+  }
+}
+
+/**
+ * Orden de intento: primero los modelos sanos, luego los penalizados por poco tiempo
+ * (el que antes se recupera, antes). Los que tienen la cuota del día agotada se saltan,
+ * salvo que no quede ningún otro: entonces se prueban igual, por si el dato guardado ya
+ * no vale (p. ej. se activó la facturación).
+ */
+function ordenarPorSalud(modelos: string[]): string[] {
+  const ahora = Date.now();
+  const resta = (m: string) => Math.max(0, (saturadoHasta.get(m) ?? 0) - ahora);
+  const sanos = modelos.filter((m) => resta(m) === 0);
+  const tocados = modelos.filter((m) => resta(m) > 0).sort((a, b) => resta(a) - resta(b));
+  const recuperables = tocados.filter((m) => resta(m) <= UMBRAL_AGOTADO_MS);
+  return sanos.length + recuperables.length > 0 ? [...sanos, ...recuperables] : tocados;
+}
+
+/** Texto para el usuario cuando todo falló por cuota: cuánto falta para el primero. */
+function avisoDeCuota(modelos: string[]): string {
+  const falta = Math.min(...modelos.map((m) => (saturadoHasta.get(m) ?? 0) - Date.now()));
+  const cuando = falta > 3600_000 ? `en unas ${Math.ceil(falta / 3600_000)} h`
+    : falta > 60_000 ? `en unos ${Math.ceil(falta / 60_000)} min` : "en un minuto";
+  return (
+    `Se agotó la cuota gratuita de Gemini en todos los modelos (20 peticiones al día por modelo). ` +
+    `Vuelve a intentarlo ${cuando}, o activa la facturación en Google AI Studio para quitar el límite.`
+  );
+}
+
+// Límite por intento, proporcional a las páginas del envío. Con el formato compacto un
+// envío de 3 páginas sale en ~10-15 s (hasta ~30 s con el servicio cargado); si pasa
+// holgadamente de eso, el modelo está saturado y conviene pasar al siguiente. El último
+// de la cadena recibe más margen: si llegó hasta ahí, cortarlo antes solo cambiaría una
+// espera por un error. (El servidor recorta todo a 280 s para no chocar con los 300 s de
+// maxDuration en Vercel.)
+const TIEMPO_BASE_MS = 30_000;
+const TIEMPO_POR_PAGINA_MS = 10_000;
+
+function tiempoIntento(paginas: number, esUltimo: boolean): number {
+  const base = TIEMPO_BASE_MS + TIEMPO_POR_PAGINA_MS * paginas;
+  return esUltimo ? base * 2.5 : base;
+}
+
 interface RespuestaGemini {
   text: string;
   finishReason: string | null;
@@ -39,7 +180,8 @@ async function llamarGemini(peticion: {
   model: string;
   contents: Part[];
   config: Record<string, unknown>;
-}): Promise<RespuestaGemini> {
+  timeoutMs?: number;
+}, signal?: AbortSignal): Promise<RespuestaGemini> {
   const cuerpo = JSON.stringify(peticion);
   if (cuerpo.length > LIMITE_PETICION_BYTES) {
     const mb = (cuerpo.length / 1024 / 1024).toFixed(1);
@@ -52,6 +194,7 @@ async function llamarGemini(peticion: {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: cuerpo,
+    signal,
   });
   // Vercel responde algunos fallos (413, timeout) con texto plano, no con JSON.
   const datos = await res.json().catch(() => null);
@@ -59,7 +202,7 @@ async function llamarGemini(peticion: {
     if (res.status === 413) {
       throw new ErrorTamano("El envío es demasiado grande para el servidor (límite de 4.5 MB).");
     }
-    throw new Error(datos?.error || `El servidor respondió ${res.status}.`);
+    throw new ErrorModelo(datos?.error || `El servidor respondió ${res.status}.`, res.status);
   }
   return { text: datos?.text ?? "", finishReason: datos?.finishReason ?? null };
 }
@@ -82,8 +225,8 @@ function soportaResolucionPorParte(modelName: string): boolean {
 }
 
 /**
- * Construye las partes de la petición. Cada imagen se envía con la etiqueta de su
- * archivo delante para que el modelo pueda rellenar SourceFile sin inventárselo.
+ * Construye las partes de la petición. Cada imagen va precedida de su etiqueta
+ * "Archivo N": es el N que el modelo devuelve en @IMAGEN para decir de cuál habla.
  *
  * ULTRA_HIGH es el punto clave para manuscrita: Gemini reparte un presupuesto fijo de
  * tokens por imagen (1120 por defecto, y solo 560 en PDF). Una A4 con 20 filas deja a
@@ -109,9 +252,7 @@ function construirPartes(
     parts.push(imagen);
   });
 
-  parts.push({
-    text: "Extrae la información de las tablas en estos documentos siguiendo estrictamente el formato CSV requerido. Es CRITICO que en la columna 'SourceFile' coloques exactamente el nombre del archivo (ej. A1.jpeg) de donde proviene cada fila, en 'FilaDoc' el número de renglón físico (de arriba hacia abajo, empezando en 1, sin contar la cabecera), en 'Pagina' el número de página (empezando en 1), en 'RowAnchors' los 4 enteros 'yCentroPrimera,xIzquierda,yCentroUltima,xDerecha' (0-1000): el centro vertical del PRIMER y del ÚLTIMO renglón de datos y los bordes izquierdo/derecho de la tabla (idéntico para toda la página), y en 'TotalFilas' el número del último renglón físico (idéntico para toda la página). Apunta los centros con precisión: de ellos depende que la marca caiga exactamente sobre la fila correcta.",
-  });
+  parts.push({ text: EXTRACTION_INSTRUCTION });
 
   return parts;
 }
@@ -122,83 +263,166 @@ export interface ArchivoEntrada {
   name: string;
   /** Página real dentro del documento (1-based). Solo para PDFs de varias hojas. */
   pagina?: number;
+  /** Si la imagen es un recorte de la página, la zona que ocupa en ella (ver tableCrop.ts). */
+  recorte?: Zona;
+  /** Renglones de la tabla medidos por la app sobre la página (ver tableCrop.ts). */
+  renglones?: Renglones;
 }
 
-// Presupuesto por envío para el reparto en lotes. Por debajo del límite duro (4.3 MB) para
-// dejar sitio a las etiquetas, el prompt del sistema y el envoltorio JSON.
-const PRESUPUESTO_LOTE_BYTES = 3.8 * 1024 * 1024;
+// Páginas por envío: es el punto de equilibrio entre velocidad y cuota.
+//  - Velocidad: una página por envío es lo más rápido (7 hojas en paralelo: ~45 s en
+//    total, frente a ~140 s de un envío de 4 páginas razonando al máximo).
+//  - Cuota: el plan gratuito de Gemini da 20 peticiones AL DÍA por modelo. Con una página
+//    por envío, un acta de 7 hojas gasta 7 peticiones y el día se acaba en ~14 actas.
+// Con 3, un acta de 7 hojas gasta 3 peticiones (3+3+1). Con facturación activada en
+// Google AI Studio el tope diario desaparece y conviene volver a 1.
+const PAGINAS_POR_ENVIO = 3;
+
+// Cuántos envíos van a la vez. El tope evita disparar un PDF de 30 hojas de golpe.
+const ENVIOS_EN_PARALELO = 4;
+
+// Presupuesto por envío, por debajo del límite duro (4.3 MB) para dejar sitio a las
+// etiquetas, el prompt del sistema y el envoltorio JSON.
+const PRESUPUESTO_ENVIO_BYTES = 3.8 * 1024 * 1024;
 
 /**
- * Parte las páginas en lotes contiguos que quepan en un envío. Se busca el MENOR número
- * de lotes, y de tamaño parejo (no "llenar el primero y el resto al último"): así cada
- * llamada tarda parecido y, al ir en paralelo, el total lo marca el lote más lento.
- *
- * Parejo y contiguo también garantiza que los lotes 2.º en adelante empiezan en una
- * página mayor que el tamaño de cualquier lote; renumerarPaginas se apoya en eso.
+ * Agrupa las páginas en envíos contiguos de PAGINAS_POR_ENVIO. Si un grupo no cabe (fotos
+ * muy pesadas), se manda página a página.
  */
-function repartirEnLotes(files: ArchivoEntrada[]): ArchivoEntrada[][] {
-  const peso = (f: ArchivoEntrada) => f.data.length;
-  const total = files.reduce((acc, f) => acc + peso(f), 0);
-  for (let k = Math.max(1, Math.ceil(total / PRESUPUESTO_LOTE_BYTES)); k <= files.length; k++) {
-    const porLote = Math.ceil(files.length / k);
-    const lotes: ArchivoEntrada[][] = [];
-    for (let i = 0; i < files.length; i += porLote) lotes.push(files.slice(i, i + porLote));
-    if (lotes.every((l) => l.reduce((acc, f) => acc + peso(f), 0) <= PRESUPUESTO_LOTE_BYTES)) {
-      return lotes;
-    }
+function agruparEnEnvios(files: ArchivoEntrada[]): ArchivoEntrada[][] {
+  const envios: ArchivoEntrada[][] = [];
+  for (let i = 0; i < files.length; i += PAGINAS_POR_ENVIO) {
+    const grupo = files.slice(i, i + PAGINAS_POR_ENVIO);
+    const peso = grupo.reduce((acc, f) => acc + f.data.length, 0);
+    if (peso <= PRESUPUESTO_ENVIO_BYTES) envios.push(grupo);
+    else envios.push(...grupo.map((f) => [f]));
   }
-  return files.map((f) => [f]); // una página por envío; si aun así no cabe, llamarGemini avisa
+  return envios;
+}
+
+async function enParalelo<T, R>(items: T[], limite: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const resultados = new Array<R>(items.length);
+  let siguiente = 0;
+  const trabajador = async () => {
+    while (siguiente < items.length) {
+      const i = siguiente++;
+      resultados[i] = await fn(items[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limite, items.length) }, trabajador));
+  return resultados;
+}
+
+interface FilaLeida {
+  nombre: string;
+  dni: string;
+  origen: string;   // nombre del documento, sin el sufijo de página
+  fila: string;     // renglón físico dentro de su página
+  pagina: number;   // página real del documento
+  anclas: string;   // "yPrimera,xIzq,yUltima,xDer" en 0-1000 de la página ENTERA
+  total: string;    // renglones de la tabla de esa página
+}
+
+/** Pasa el anclaje de coordenadas del recorte (0-1000) a las de la página entera. */
+function anclasEnPagina(anclas: string, recorte?: Zona): string {
+  const v = anclas.split(",").map((n) => parseFloat(n));
+  if (v.length !== 4 || v.some((n) => isNaN(n))) return "";
+  if (!recorte) return v.map((n) => Math.round(n)).join(",");
+  const y = (n: number) => Math.round((recorte.y0 + (n / 1000) * (recorte.y1 - recorte.y0)) * 1000);
+  const x = (n: number) => Math.round((recorte.x0 + (n / 1000) * (recorte.x1 - recorte.x0)) * 1000);
+  return [y(v[0]), x(v[1]), y(v[2]), x(v[3])].join(",");
 }
 
 /**
- * Deja la columna Pagina con el número de hoja REAL del documento. Dentro de un lote el
- * modelo puede numerar desde 1 (la 6.ª hoja del PDF es la 2.ª imagen que ve), y el visor
- * abriría entonces la hoja equivocada.
+ * Interpreta la respuesta compacta del modelo (formato definido en EXTRACTION_PROMPT):
  *
- *  1. Si SourceFile coincide con la etiqueta de una imagen del lote, manda esa etiqueta.
- *  2. Si no, un número que ya es una página del lote se respeta (vino en absoluto).
- *  3. Si no, se lee como posición dentro del lote (vino en relativo).
+ *   @IMAGEN;N;yPrimera,xIzq,yUltima,xDer;TotalRenglones
+ *   Renglon;Apellidos y Nombres;DNI
+ *
+ * La página de cada fila NO se le pregunta al modelo: sale de la imagen N del envío, que
+ * la app sabe a qué hoja corresponde. Antes el modelo la escribía en cada fila y a veces
+ * numeraba desde 1 dentro del envío, con lo que el visor abría la hoja equivocada.
+ *
+ * Lanza un error (y se prueba el siguiente modelo) si falta el bloque de alguna imagen:
+ * aceptar la respuesta sería dar por buena una hoja entera sin leer.
  */
-function renumerarPaginas(lineas: string[], lote: ArchivoEntrada[]): string[] {
-  const paginas = lote.map((f) => f.pagina);
-  if (paginas.some((p) => p === undefined)) return lineas; // imagen suelta: nada que hacer
-  const porEtiqueta = new Map(lote.map((f) => [f.name.trim().toLowerCase(), f.pagina!]));
-  const delLote = new Set(paginas as number[]);
+function interpretarRespuesta(texto: string, lote: ArchivoEntrada[]): FilaLeida[] {
+  const filas: FilaLeida[] = [];
+  const vistas = new Set<number>();
+  let actual = 0, anclas = "", total = "";
 
-  return lineas.map((linea) => {
-    const cols = linea.split(";");
-    if (cols.length < 8) return linea;
-    const n = parseInt(cols[7], 10);
-    const real =
-      porEtiqueta.get(cols[5].trim().toLowerCase()) ??
-      (delLote.has(n) ? n : n >= 1 && n <= lote.length ? lote[n - 1].pagina : undefined);
-    if (real !== undefined) cols[7] = String(real);
-    return cols.join(";");
-  });
+  for (const linea of texto.split("\n").map((l) => l.trim())) {
+    if (!linea || linea.startsWith("```")) continue;
+    const cols = linea.split(";").map((c) => c.trim());
+
+    if (/^@IMAGEN$/i.test(cols[0])) {
+      const n = parseInt(cols[1], 10);
+      // Un N fuera de rango se toma por orden de aparición: mejor que tirar el bloque.
+      actual = n >= 1 && n <= lote.length ? n - 1 : Math.min(vistas.size, lote.length - 1);
+      vistas.add(actual);
+      total = /^\d+$/.test(cols[3] ?? "") ? cols[3] : "";
+      // Si la app midió los renglones sobre las líneas impresas y el modelo cuenta los
+      // mismos, se usa esa medida: es exacta. Las coordenadas del modelo quedan para
+      // cuando no hay medida local o los recuentos no cuadran (no hablarían de los mismos
+      // renglones, y numerar con una geometría ajena desplazaría todas las marcas).
+      const medida = lote[actual].renglones;
+      if (medida && (total === "" || total === String(medida.total))) {
+        total = String(medida.total);
+        anclas = [medida.yPrimera, medida.xIzq, medida.yUltima, medida.xDer].map((v) => Math.round(v * 1000)).join(",");
+      } else {
+        anclas = anclasEnPagina(cols[2] ?? "", lote[actual].recorte);
+      }
+      continue;
+    }
+    if (!/^\d+$/.test(cols[0]) || cols.length < 3) continue; // cabecera u otro texto suelto
+
+    const archivo = lote[actual];
+    filas.push({
+      // Si un nombre trajera un ";" suelto, el DNI sigue siendo la última columna.
+      nombre: cols.slice(1, -1).join(" "),
+      dni: cols[cols.length - 1],
+      origen: archivo.name.replace(/\s*\(página \d+\)$/, ""),
+      fila: cols[0],
+      pagina: archivo.pagina ?? 1,
+      anclas,
+      total,
+    });
+  }
+
+  if (vistas.size === 0 && filas.length === 0) {
+    throw new Error("La respuesta del modelo no sigue el formato esperado.");
+  }
+  if (vistas.size < lote.length && lote.length > 1) {
+    throw new Error(`El modelo solo informó de ${vistas.size} de las ${lote.length} imágenes del envío.`);
+  }
+  return filas;
 }
 
 /**
- * Extrae un documento. Un PDF de muchas hojas no cabe en un solo envío (límite de 4.5 MB
- * de Vercel: 7 hojas ya lo pasan), así que se reparte en lotes que se procesan en
- * paralelo y se unen en un único CSV. Cada hoja de estas fichas es independiente, así que
- * partir entre hojas no le quita al modelo contexto que necesite.
+ * Extrae un documento: las páginas van en grupos (agruparEnEnvios), los envíos en
+ * paralelo, y todo se une en un único CSV. Cada hoja de estas fichas es independiente, así
+ * que separarlas no le quita al modelo contexto que necesite; y cada envío queda por
+ * debajo del límite de 4.5 MB de Vercel, sea cual sea el número de hojas.
  */
 export async function processDocuments(files: ArchivoEntrada[]): Promise<ProcessedResult> {
-  const lotes = repartirEnLotes(files);
-  if (lotes.length > 1) {
-    console.log(`Documento repartido en ${lotes.length} envíos: ${lotes.map((l) => l.length).join(" + ")} páginas.`);
-  }
+  const lotes = agruparEnEnvios(files);
+  const t0 = performance.now();
 
-  const resultados = await Promise.all(lotes.map((lote) => extraerLote(lote)));
-
-  const filas = resultados.flatMap((r, i) =>
-    renumerarPaginas(
-      r.csv.split("\n").filter((l) => l.trim() && !l.toLowerCase().includes("sourcefile")),
-      lotes[i]
-    )
+  const resultados = await enParalelo(lotes, ENVIOS_EN_PARALELO, (lote) => extraerLote(lote));
+  console.log(
+    `Extracción de ${files.length} página(s) en ${lotes.length} envío(s) ` +
+    `(${lotes.map((l) => l.length).join(" + ")}): ${((performance.now() - t0) / 1000).toFixed(1)} s.`
   );
-  const csv = [CABECERA_CSV, ...filas].join("\n");
-  if (lotes.length > 1) console.log("=== CSV unido de todos los envíos ===\n" + csv);
+
+  // El resto de la app trabaja con el CSV de 10 columnas. Ocupación y Área quedan vacías
+  // a propósito: no se le piden al modelo porque la app las toma de la lista maestra.
+  const lineas = resultados
+    .flatMap((r) => r.filas)
+    .map((f, i) => [i + 1, f.nombre, f.dni, "", "", f.origen, f.fila, f.pagina, f.anclas, f.total].join(";"));
+  const csv = [CABECERA_CSV, ...lineas].join("\n");
+  // Resultado ya interpretado a la consola: junto con la respuesta cruda de cada envío,
+  // permite distinguir si el modelo leyó mal o si el fallo está en la interpretación.
+  console.log("=== CSV unido de todos los envíos ===\n" + csv);
 
   return {
     csv,
@@ -206,16 +430,18 @@ export async function processDocuments(files: ArchivoEntrada[]): Promise<Process
   };
 }
 
-async function extraerLote(files: ArchivoEntrada[]): Promise<ProcessedResult> {
+async function extraerLote(files: ArchivoEntrada[]): Promise<{ filas: FilaLeida[]; modelUsed: string }> {
   let lastError: any;
+  let soloCuota = true;
   const triedModels: string[] = [];
+  const modelos = ordenarPorSalud(MODELS);
 
-  for (const modelName of MODELS) {
+  for (const [i, modelName] of modelos.entries()) {
     try {
       console.log(`Intentando extracción con el modelo: ${modelName}`);
       triedModels.push(modelName);
 
-      const response = await llamarGemini({
+      const response = await conCancelacion(modelName, i < modelos.length - 1, (signal) => llamarGemini({
         model: modelName,
         contents: construirPartes(files, soportaResolucionPorParte(modelName)),
         config: {
@@ -224,42 +450,39 @@ async function extraerLote(files: ArchivoEntrada[]): Promise<ProcessedResult> {
           // mismo documento podía dar dos lecturas distintas en dos ejecuciones.
           temperature: 0,
           maxOutputTokens: MAX_OUTPUT_TOKENS,
+          // Gemini 3 razona al máximo si no se le dice nada. Medido sobre 60 renglones
+          // manuscritos: "low" baja de ~32 s a ~19 s por página y acierta igual o más DNIs
+          // contra la maestra (31 vs 29). Leer una tabla no necesita deliberar mucho.
+          // Gemini 2.5 no acepta este campo, por eso solo va en los 3.
+          ...(/^gemini-3/.test(modelName) ? { thinkingConfig: { thinkingLevel: "LOW" } } : {}),
         },
-      });
+        timeoutMs: tiempoIntento(files.length, i === modelos.length - 1),
+      }, signal));
 
       if (response.finishReason === "MAX_TOKENS") {
         throw new Error(
           "La respuesta se cortó por longitud: el documento tiene más filas de las que caben en una sola pasada."
         );
       }
+      if (!response.text) throw new Error("Respuesta vacía del modelo.");
 
-      let text = response.text;
-      if (!text) throw new Error("Respuesta vacía del modelo.");
-
-      text = text.replace(/^```(csv|txt)?\n/i, "");
-      text = text.replace(/\n```$/i, "");
-      text = text.trim();
-
-      if (!text.toLowerCase().includes("sourcefile")) {
-        text = CABECERA_CSV + "\n" + text;
-      }
-
-      console.log(`¡Éxito con el modelo ${modelName}!`);
       // Respuesta cruda a la consola: cuando una extracción sale mal, es la única
       // forma de distinguir si el modelo leyó mal el documento o si el fallo está
-      // en cómo la app interpreta el CSV.
-      console.log("=== CSV devuelto por el modelo ===\n" + text);
-      return {
-        csv: text,
-        modelUsed: modelName,
-      };
+      // en cómo la app interpreta la respuesta.
+      console.log(`=== Respuesta de ${modelName} ===\n` + response.text);
+      const filas = interpretarRespuesta(response.text, files);
+      console.log(`¡Éxito con el modelo ${modelName}!`);
+      return { filas, modelUsed: modelName };
     } catch (error: any) {
       if (error instanceof ErrorTamano) throw error;
+      registrarFallo(modelName, error);
+      if (!(error instanceof ErrorModelo && error.status === 429)) soloCuota = false;
       console.error(`Error con el modelo ${modelName}:`, error);
       lastError = error;
     }
   }
 
+  if (soloCuota && lastError) throw new Error(avisoDeCuota(triedModels));
   throw new Error(
     `Fallaron todos los modelos intentados (${triedModels.join(", ")}). Último error: ${lastError?.message || String(lastError)}`
   );
@@ -350,9 +573,12 @@ export async function releerFilas(
   });
 
   let lastError: any;
-  for (const modelName of MODELOS_RELECTURA) {
+  // Aquí NO se baja el razonamiento: son justo los renglones que la pasada normal no
+  // resolvió, y deliberar dígito a dígito es lo que se busca. Sí se evita el modelo saturado.
+  const modelosRelectura = ordenarPorSalud(MODELOS_RELECTURA);
+  for (const [i, modelName] of modelosRelectura.entries()) {
     try {
-      const response = await llamarGemini({
+      const response = await conCancelacion(modelName, i < modelosRelectura.length - 1, (signal) => llamarGemini({
         model: modelName,
         contents: parts,
         config: {
@@ -362,7 +588,9 @@ export async function releerFilas(
           responseMimeType: "application/json",
           responseSchema: ESQUEMA_RELECTURA,
         },
-      });
+        // Los recortes son pequeños: se cuentan como una página cada tres.
+        timeoutMs: tiempoIntento(Math.ceil(recortes.length / 3), i === modelosRelectura.length - 1),
+      }, signal));
 
       if (response.finishReason === "MAX_TOKENS") {
         throw new Error("La relectura se cortó por longitud.");
@@ -375,6 +603,7 @@ export async function releerFilas(
       return { lecturas, modelUsed: modelName };
     } catch (error: any) {
       if (error instanceof ErrorTamano) throw error;
+      registrarFallo(modelName, error);
       console.error(`Relectura fallida con ${modelName}:`, error);
       lastError = error;
     }

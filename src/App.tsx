@@ -39,6 +39,7 @@ import { claveConfigurada, processDocuments, releerFilas } from "./lib/gemini";
 import { recortarFilas, type RecorteFila } from "./lib/rowCrop";
 import { copiarTexto } from "./lib/clipboard";
 import { renderPdfToImages } from "./lib/pdf";
+import type { Renglones, Zona } from "./lib/tableCrop";
 import { enhanceForOcr } from "./lib/imagePrep";
 import { detectDataRowBands } from "./lib/rowDetect";
 import { APP_NAME, APP_SUBTITLE, MASTER_DATA_URL } from "./config";
@@ -54,8 +55,9 @@ interface DocumentFile {
   pages: string[]; // imágenes (data URL) por página tal cual son; imagen = 1 página
   // Las mismas páginas tras el preprocesado de contraste que se le manda al OCR.
   // Son las que ve el modelo; el visor sigue mostrando `pages` (el documento real).
-  // El preprocesado no mueve píxeles, así que las coordenadas de una sirven en la otra.
-  ocrPages: { base64: string; mimeType: string }[];
+  // Si se recortaron a la tabla, `recorte` dice qué zona de la página contienen:
+  // processDocuments la usa para devolver las coordenadas referidas a la página entera.
+  ocrPages: { base64: string; mimeType: string; recorte?: Zona; renglones?: Renglones }[];
 }
 
 interface BBox {
@@ -573,12 +575,12 @@ export default function App() {
         // Limpieza de sombras y contraste antes de mandarlo al OCR (visión clásica).
         // En serie y no en paralelo: así el avance es real y no se dispara la memoria
         // con un PDF de muchas hojas.
-        const ocrPages: { base64: string; mimeType: string }[] = [];
+        const ocrPages: DocumentFile["ocrPages"] = [];
         for (let p = 0; p < pages.length; p++) {
           const pct = FIN_RASTER + ((100 - FIN_RASTER) * p) / Math.max(1, pages.length);
           await avance(pct, pages.length > 1 ? `Mejorando imagen ${p + 1} de ${pages.length}` : "Mejorando imagen");
-          const prep = await enhanceForOcr(pages[p]);
-          ocrPages.push({ base64: prep.base64, mimeType: prep.mimeType });
+          const prep = await enhanceForOcr(pages[p], 2200, { recortarTabla: true });
+          ocrPages.push({ base64: prep.base64, mimeType: prep.mimeType, recorte: prep.recorte, renglones: prep.renglones });
         }
         await avance(100, "Listo");
 
@@ -615,12 +617,13 @@ export default function App() {
           return [{ data: f.base64, mimeType: f.mimeType, name: f.name }]; // por si el preprocesado falló
         }
         if (f.ocrPages.length === 1) {
-          return [{ data: f.ocrPages[0].base64, mimeType: f.ocrPages[0].mimeType, name: f.name }];
+          return [{ data: f.ocrPages[0].base64, mimeType: f.ocrPages[0].mimeType, name: f.name, recorte: f.ocrPages[0].recorte, renglones: f.ocrPages[0].renglones }];
         }
         // `pagina` deja que processDocuments reparta un PDF largo en varios envíos sin
         // perder a qué hoja pertenece cada fila.
         return f.ocrPages.map((p, i) => ({
           data: p.base64, mimeType: p.mimeType, name: `${f.name} (página ${i + 1})`, pagina: i + 1,
+          recorte: p.recorte, renglones: p.renglones,
         }));
       })();
       const result = await processDocuments(inputFormats);

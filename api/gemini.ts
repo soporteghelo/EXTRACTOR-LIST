@@ -20,6 +20,13 @@ import { GoogleGenAI } from "@google/genai";
 const MODELO_VALIDO = /^gemini-[\w.-]+$/;
 const TECHO_TOKENS_SALIDA = 32768;
 
+// Límite por intento. Un modelo saturado a veces no responde con error sino que se queda
+// colgado hasta 5 minutos; cortar antes deja al cliente pasar al siguiente modelo.
+// El techo queda por debajo de los 300 s de maxDuration (vercel.json) para que la función
+// alcance a responder un 504 legible en vez de que Vercel la mate a la fuerza.
+const TIEMPO_POR_DEFECTO_MS = 90_000;
+const TIEMPO_MAXIMO_MS = 280_000;
+
 function claveServidor(): string | undefined {
   return process.env.GEMINI_API_KEY?.trim() || undefined;
 }
@@ -66,7 +73,8 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
     return responder(res, 400, { error: "El cuerpo de la petición no es JSON válido." });
   }
 
-  const { model, contents, config } = cuerpo ?? {};
+  const { model, contents, config, timeoutMs } = cuerpo ?? {};
+  const limiteMs = Math.min(Math.max(Number(timeoutMs) || TIEMPO_POR_DEFECTO_MS, 10_000), TIEMPO_MAXIMO_MS);
   if (typeof model !== "string" || !MODELO_VALIDO.test(model)) {
     return responder(res, 400, { error: "Modelo no permitido." });
   }
@@ -82,6 +90,7 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
       config: {
         ...(config ?? {}),
         maxOutputTokens: Math.min(Number(config?.maxOutputTokens) || TECHO_TOKENS_SALIDA, TECHO_TOKENS_SALIDA),
+        abortSignal: AbortSignal.timeout(limiteMs),
       },
     });
     return responder(res, 200, {
@@ -89,6 +98,11 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
       finishReason: response.candidates?.[0]?.finishReason ?? null,
     });
   } catch (error: any) {
+    if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+      return responder(res, 504, {
+        error: `El modelo ${model} no respondió en ${Math.round(limiteMs / 1000)} s (probablemente saturado).`,
+      });
+    }
     // Se reenvía el error de Google tal cual (403 clave suspendida, 404 modelo retirado,
     // 429 cuota...): el cliente prueba el siguiente modelo y, si todos fallan, lo muestra.
     const status = Number(error?.status) >= 400 ? Number(error.status) : 502;

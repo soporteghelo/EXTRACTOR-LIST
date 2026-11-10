@@ -10,51 +10,75 @@ export const MASTER_DATA_URL = "https://docs.google.com/spreadsheets/d/1OqjJIobn
  * Gemini AI Configuration
  */
 // Cadena de respaldo: se prueban en orden y gana el primero que responde. El orden
-// importa en latencia, no solo en calidad: cada modelo retirado que quede por delante
-// es una petición que falla y se paga en tiempo antes de llegar a uno que funciona.
-// (La lista anterior empezaba por gemini-2.0-flash, apagado desde hace tiempo, así que
-// toda extracción quemaba un intento fallido y acababa corriendo sobre 2.5-flash.)
+// importa en latencia, no solo en calidad: cada modelo retirado o saturado que quede por
+// delante es una petición que falla y se paga en tiempo antes de llegar a uno que funciona.
 //
-// Solo modelos de Gemini 3 en cabeza: la lectura de manuscrita mejora de forma notable
-// entre generaciones, y `mediaResolution` por parte (ULTRA_HIGH) requiere Gemini 3.
+// Cada entrada debe tener SU PROPIA cuota. En el plan gratuito son 20 peticiones al día
+// por modelo, y los alias no suman: "gemini-3.5-flash" se descuenta de la cuota de
+// 3.6-flash y "gemini-flash-latest" de la de 3.8-flash (lo dice el propio error 429).
+// Por eso 3.5-flash ya no está en la lista: solo añadía un intento fallido.
+//
+// Orden medido el 2026-11-10 sobre 51 renglones manuscritos (filas resueltas contra la
+// maestra / segundos por envío de 3 páginas):
+//   3.6-flash 42 / 16 s · 3-flash-preview 43 / 8 s · 3.5-flash-lite 42 / 13 s · 2.5-flash 27 / 23 s
+// 3.7 y 3.8 no se pudieron medir (saturados): van por delante por ser los más capaces,
+// y si fallan se recuerda y se saltan (ver "Salud de los modelos" en src/lib/gemini.ts).
+//
+// Solo modelos de Gemini 3 en cabeza: `mediaResolution` por parte (ULTRA_HIGH) y
+// `thinkingLevel` requieren Gemini 3. Tras tocar la lista: npm run check-models
 export const GEMINI_MODELS = [
-  "gemini-3.7-flash",    // GA, el más capaz de la familia Flash
+  "gemini-3.7-flash",        // GA, el más capaz de la familia Flash
   "gemini-3.6-flash",
-  "gemini-3.5-flash",
-  "gemini-flash-latest", // alias: sobrevive a un renombrado del catálogo
-  "gemini-2.5-flash",    // último recurso, sin soporte de resolución por parte
+  "gemini-3-flash-preview",  // tan preciso como 3.6 y el más rápido de los medidos
+  "gemini-3.5-flash-lite",   // versión ligera, pero lee manuscrita igual de bien que 3.6
+  "gemini-flash-latest",     // alias del más nuevo: sobrevive a un renombrado del catálogo
+  "gemini-2.5-flash",        // último recurso: lee bastante peor y no admite resolución por parte
 ];
 
-export const EXTRACTION_PROMPT = `Rol: Eres un sistema avanzado de Visión Computacional, OCR (Reconocimiento Óptico de Caracteres) y Extracción de Datos especializado en documentos corporativos y registros de asistencia con escritura a mano alzada.
+// Formato de salida COMPACTO. El tiempo de una extracción lo domina lo que el modelo
+// tiene que escribir, así que solo se le pide lo que la app usa de verdad:
+//  - Ocupación y Área NO se piden: la tabla y el Excel las toman de la lista maestra, y
+//    eran dos columnas manuscritas más que leer y escribir por cada persona.
+//  - Las coordenadas y el total de renglones van UNA vez por página (línea @IMAGEN), no
+//    repetidas en cada fila.
+// src/lib/gemini.ts (interpretarRespuesta) convierte esto al CSV de 10 columnas que usa
+// el resto de la app. Si cambias el formato aquí, cambia también ese intérprete.
+export const EXTRACTION_PROMPT = `Rol: Eres un sistema avanzado de Visión Computacional y OCR especializado en registros de asistencia con escritura a mano alzada.
 
 Tu Tarea Única:
-El usuario te proporcionará imágenes o documentos PDF (que pueden ser múltiples a la vez). Tu trabajo es escanear visualmente cada documento y extraer exclusivamente la tabla de participantes de los registros de inducción o capacitación.
+Recibirás una o varias imágenes, cada una precedida por una etiqueta "Archivo N: nombre". Cada imagen es una hoja de un registro de inducción o capacitación. De cada hoja extrae exclusivamente la tabla de participantes, y de ella SOLO tres datos por persona: el número de renglón, los apellidos y nombres, y el DNI. NO transcribas ocupación, área, firma ni observaciones.
 
 Reglas de Procesamiento e Interpretación (Estrictas):
-1. Filtrado de Ruido: Ignora absolutamente todo lo que no sea la lista de asistentes (logos de empresas, "Datos del Empleador", temas, horas, nombre del capacitador, firmas al pie de página).
-2. Tratamiento de Calidad (Imágenes borrosas/Escritura difícil): Utiliza tu máxima capacidad deductiva para interpretar caligrafía cursiva, borrosa o de baja resolución. Si un número de DNI parece incompleto o una letra es dudosa, usa el contexto (nombres comunes, apellidos peruanos/latinos). Si una palabra es 100% ilegible, escribe [ILEGIBLE] en lugar de inventar el dato.
-3. Líneas Anuladas: Ignora completamente cualquier fila que esté vacía o que haya sido tachada con una línea diagonal (z). No la incluyas en tu respuesta.
-3.1. Trazabilidad de Fila (CRÍTICO): Por cada participante debes indicar en qué fila física del documento fue identificado. Cuenta TODAS las filas de datos de la tabla (la franja de datos, EXCLUYENDO la fila de cabecera/títulos) de arriba hacia abajo empezando en 1. La primera línea de datos = 1, la segunda = 2, etc. IMPORTANTE: cuenta también las filas en blanco o tachadas que ocupan un renglón físico (aunque luego no las incluyas como registro), porque lo que importa es la posición visual real del renglón. Coloca ese número en la columna FilaDoc.
-3.2. Página (CRÍTICO): En la columna Pagina coloca el número de página (empezando en 1) del documento donde aparece ese registro. Si el archivo es una imagen o un PDF de una sola página, usa 1.
-3.3. Anclaje para Ubicación Exacta (CRÍTICO): NO des la caja de cada fila. En su lugar, da dos puntos de anclaje precisos que sirven para interpolar la posición de cualquier fila. En la columna RowAnchors coloca 4 enteros (0-1000) en el formato exacto "yCentroPrimera,xIzquierda,yCentroUltima,xDerecha":
-   - yCentroPrimera = coordenada VERTICAL del CENTRO del PRIMER renglón de datos (el renglón numerado como 1, el primer participante). Apunta a la mitad de la altura de ESE renglón, no al borde superior de la tabla ni a la cabecera.
-   - yCentroUltima = coordenada VERTICAL del CENTRO del ÚLTIMO renglón físico de datos de la tabla (normalmente el numerado como el más alto, p.ej. 20, aunque esté vacío). Apunta a la mitad de la altura de ese último renglón.
+1. Filtrado de Ruido: Ignora absolutamente todo lo que no sea la lista de asistentes (logos, "Datos del Empleador", tema, horas, nombre del capacitador, firmas al pie de página).
+2. Escritura difícil: Utiliza tu máxima capacidad para interpretar caligrafía cursiva, borrosa o de baja resolución. Mira los DNI dígito por dígito: las confusiones típicas en manuscrita son 1/7, 4/9, 3/8, 5/6, 0/6 y 2/7; decide por la forma del trazo. Si una letra del nombre es dudosa, usa el contexto (nombres y apellidos peruanos/latinos comunes). Si el nombre es 100% ilegible, escribe [ILEGIBLE] en lugar de inventarlo.
+3. Líneas Anuladas: Ignora completamente cualquier renglón vacío o tachado. No lo incluyas en tu respuesta.
+4. Número de renglón (CRÍTICO): Por cada participante indica en qué renglón físico de la tabla está. Cuenta TODOS los renglones de datos de arriba hacia abajo empezando en 1, EXCLUYENDO la fila de cabecera/títulos. Cuenta también los renglones en blanco o tachados (aunque no los incluyas como registro): lo que importa es la posición visual real. Normalmente coincide con el número impreso a la izquierda del renglón.
+5. Anclaje de la tabla (CRÍTICO): Por cada imagen da UNA sola vez cuatro enteros (0-1000, relativos a esa imagen) en el formato exacto "yCentroPrimera,xIzquierda,yCentroUltima,xDerecha":
+   - yCentroPrimera = coordenada VERTICAL del CENTRO del PRIMER renglón de datos (el renglón 1). Apunta a la mitad de la altura de ESE renglón, no al borde superior de la tabla ni a la cabecera.
+   - yCentroUltima = coordenada VERTICAL del CENTRO del ÚLTIMO renglón físico de datos de la tabla (normalmente el de número más alto, p.ej. 20, aunque esté vacío).
    - xIzquierda / xDerecha = bordes izquierdo y derecho de la tabla de datos.
-   En la columna TotalFilas coloca el NÚMERO del último renglón físico (es decir, cuántos renglones de datos hay en total, p.ej. 20). Debe coincidir con el renglón cuyo centro indicaste en yCentroUltima.
-   PRECISIÓN: La exactitud de yCentroPrimera y yCentroUltima es lo MÁS importante; el sistema reparte el resto de filas proporcionalmente entre esos dos centros usando el número FilaDoc de cada una. Un error en estos dos centros desplaza TODAS las marcas.
-   REGLA DE CONSISTENCIA: RowAnchors y TotalFilas deben ser IDÉNTICOS en todas las filas que pertenezcan a la misma página del mismo archivo. Se asume que la altura de cada renglón es uniforme.
-4. Multidocumento: Si el usuario sube varios archivos a la vez, consolida todos los participantes válidos en una sola tabla continua.
-5. Validación de DNI: El DNI peruano tiene exactamente 8 dígitos numéricos. Si extraes un DNI con 7 dígitos, antepón un '0'. Si contiene letras por confusión OCR (I→1, O→0, S→5, Z→2, G→6), corrígelas. Si no puedes determinar los 8 dígitos con certeza, escribe [ILEGIBLE].
-6. Preservación de Nombres: Transcribe los apellidos y nombres EXACTAMENTE como aparecen escritos, SIN correcciones ortográficas de tu parte. Si "GARCIA" está escrito sin tilde, escríbelo "GARCIA". El sistema de matching posterior maneja la normalización.
-7. Campos Vacíos: Si la columna Ocupación o Área está vacía o ilegible, usa el valor de la fila más cercana en el mismo documento (los asistentes suelen ser del mismo área). Si no hay referencia disponible, escribe [ILEGIBLE].
+   Y da TotalRenglones = el NÚMERO del último renglón físico (cuántos renglones de datos tiene la tabla en total, p.ej. 20). Debe ser el renglón cuyo centro indicaste en yCentroUltima.
+   PRECISIÓN: la exactitud de yCentroPrimera y yCentroUltima es lo MÁS importante; el sistema ubica cada renglón repartiéndolos proporcionalmente entre esos dos centros. Un error ahí desplaza TODAS las marcas.
+6. Validación de DNI: El DNI peruano tiene exactamente 8 dígitos. Si lees 7 dígitos, antepón un '0'. Si aparece una letra por confusión (I→1, O→0, S→5, Z→2, G→6), corrígela. Si no puedes determinar los 8 dígitos con certeza, escribe [ILEGIBLE].
+7. Preservación de Nombres: Transcribe los apellidos y nombres EXACTAMENTE como están escritos, SIN corregir ortografía ni tildes. El sistema de matching posterior maneja la normalización.
 
-Formato de Salida Obligatorio (CSV):
-No quiero saludos, ni explicaciones, ni texto adicional. Tu respuesta debe ser únicamente texto plano en formato CSV (Valores Separados por Comas) usando punto y coma (;) como separador.
-La primera línea debe ser exactamente esta cabecera:
-Nro;Apellidos y Nombres;DNI;Ocupacion;Area;SourceFile;FilaDoc;Pagina;RowAnchors;TotalFilas
-En la columna SourceFile, indica el nombre del archivo original de donde extrajiste esa fila exacta.
-En la columna FilaDoc, indica el número de renglón físico (posición visual de arriba hacia abajo, empezando en 1, excluyendo la cabecera) en el que se encuentra ese registro dentro de su documento de origen.
-En la columna Pagina, indica el número de página (empezando en 1) donde aparece el registro.
-En la columna RowAnchors, indica "yCentroPrimera,xIzquierda,yCentroUltima,xDerecha" (4 enteros 0-1000): el centro vertical del PRIMER renglón de datos, el borde izquierdo, el centro vertical del ÚLTIMO renglón de datos, y el borde derecho de la tabla. Debe ser idéntico para todas las filas de la misma página.
-En la columna TotalFilas, indica el número del último renglón físico de datos (cuántos renglones hay en total). Debe coincidir con yCentroUltima y ser idéntico para todas las filas de la misma página.
-IMPORTANTE: como el separador del CSV es punto y coma (;), los 4 valores de RowAnchors van separados por comas dentro de un único campo, NO uses punto y coma dentro de RowAnchors.`;
+Formato de Salida Obligatorio:
+Sin saludos, explicaciones, cabeceras ni bloques de código. Solo texto plano con punto y coma (;) como separador, así:
+- Por CADA imagen recibida, en el mismo orden, una línea de encabezado:
+  @IMAGEN;N;yCentroPrimera,xIzquierda,yCentroUltima,xDerecha;TotalRenglones
+  donde N es el número de su etiqueta "Archivo N".
+- Debajo, una línea por cada participante de esa imagen:
+  Renglon;Apellidos y Nombres;DNI
+Los cuatro valores del anclaje van separados por comas dentro de un único campo; no uses punto y coma dentro de él ni dentro de los nombres.
+
+Ejemplo de estructura para dos imágenes (Y1,X1,Y2,X2 y TOTAL representan los enteros que TÚ debes medir en cada imagen; nunca copies valores de este ejemplo):
+@IMAGEN;1;Y1,X1,Y2,X2;TOTAL
+1;Quispe Mamani Juan;45871236
+2;ROJAS HUAMAN PEDRO;[ILEGIBLE]
+4;Flores Ccori Luis A.;07412589
+@IMAGEN;2;Y1,X1,Y2,X2;TOTAL
+1;Vargas Soto Maria;71203344`;
+
+// Mensaje que acompaña a las imágenes. Corto a propósito: las reglas viven arriba.
+export const EXTRACTION_INSTRUCTION =
+  "Extrae los participantes de cada imagen siguiendo estrictamente el formato indicado: una línea @IMAGEN por cada imagen (con su anclaje y total de renglones) y debajo una línea 'Renglon;Apellidos y Nombres;DNI' por participante. Apunta los centros del primer y último renglón con precisión: de ellos depende que la marca caiga exactamente sobre la fila correcta.";
